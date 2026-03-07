@@ -1,0 +1,64 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Build output
+frontend/build/
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.whl
+venv/
+.venv/
+env/
+
+# Lambda packaging
+lambda/**/function.zip
+lambda/**/package/
+lambda-arns.json
+layer-build/
+
+# Environment & secrets
+.env
+.env.local
+.env.production
+frontend/.env.local
+frontend/.env.production
+
+# IDE
+.vscode/
+.idea/
+.kiro/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# AWS
+infrastructure/config/
+*.tfstate
+*.tfstate.backup
+
+# Hypothesis testing cache
+.hypothesis/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Misc
+*.zip
+*.tar.gz

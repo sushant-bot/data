@@ -1,0 +1,195 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Master template for AI Data Analyst Platform infrastructure'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'ai-data-analyst-platform'
+    Description: 'Name of the project for resource naming'
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name'
+
+  UploadLambdaArn:
+    Type: String
+    Description: 'ARN of the Upload Lambda function'
+    Default: ''
+
+  PreviewLambdaArn:
+    Type: String
+    Description: 'ARN of the Preview Lambda function'
+    Default: ''
+
+  ProcessingLambdaArn:
+    Type: String
+    Description: 'ARN of the Processing Lambda function'
+    Default: ''
+
+  MLTrainingLambdaArn:
+    Type: String
+    Description: 'ARN of the ML Training Lambda function'
+    Default: ''
+
+  AIAssistantLambdaArn:
+    Type: String
+    Description: 'ARN of the AI Assistant Lambda function'
+    Default: ''
+
+  VisualizationLambdaArn:
+    Type: String
+    Description: 'ARN of the Visualization Lambda function'
+    Default: ''
+
+  SessionLambdaArn:
+    Type: String
+    Description: 'ARN of the Session Lambda function (reuses Preview Lambda)'
+    Default: ''
+
+Conditions:
+  HasLambdaArns: !Not [!Equals [!Ref UploadLambdaArn, '']]
+
+Resources:
+  # S3 Buckets Stack
+  S3Stack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: './s3-buckets.yaml'
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'StackType'
+          Value: 'S3'
+
+  # DynamoDB Tables Stack
+  DynamoDBStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: './dynamodb-tables.yaml'
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'StackType'
+          Value: 'DynamoDB'
+
+  # API Gateway Stack (only when Lambda ARNs are provided)
+  APIGatewayStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: HasLambdaArns
+    Properties:
+      TemplateURL: './api-gateway.yaml'
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        UploadLambdaArn: !Ref UploadLambdaArn
+        PreviewLambdaArn: !Ref PreviewLambdaArn
+        ProcessingLambdaArn: !Ref ProcessingLambdaArn
+        MLTrainingLambdaArn: !Ref MLTrainingLambdaArn
+        AIAssistantLambdaArn: !Ref AIAssistantLambdaArn
+        VisualizationLambdaArn: !Ref VisualizationLambdaArn
+        SessionLambdaArn: !Ref SessionLambdaArn
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'StackType'
+          Value: 'API Gateway'
+
+  # CloudFront Stack
+  CloudFrontStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: S3Stack
+    Properties:
+      TemplateURL: './cloudfront.yaml'
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        StaticWebsiteBucketName: !GetAtt S3Stack.Outputs.StaticWebsiteBucketName
+        StaticWebsiteBucketDomainName: !Sub '${S3Stack.Outputs.StaticWebsiteBucketName}.s3-website-${AWS::Region}.amazonaws.com'
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'StackType'
+          Value: 'CloudFront'
+
+Outputs:
+  # S3 Outputs
+  StaticWebsiteBucketName:
+    Description: 'Name of the S3 bucket for static website hosting'
+    Value: !GetAtt S3Stack.Outputs.StaticWebsiteBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-StaticWebsiteBucket'
+
+  DataStorageBucketName:
+    Description: 'Name of the S3 bucket for data storage'
+    Value: !GetAtt S3Stack.Outputs.DataStorageBucketName
+    Export:
+      Name: !Sub '${AWS::StackName}-DataStorageBucket'
+
+  # DynamoDB Outputs
+  SessionsTableName:
+    Description: 'Name of the Sessions DynamoDB table'
+    Value: !GetAtt DynamoDBStack.Outputs.SessionsTableName
+    Export:
+      Name: !Sub '${AWS::StackName}-SessionsTable'
+
+  OperationsTableName:
+    Description: 'Name of the Operations DynamoDB table'
+    Value: !GetAtt DynamoDBStack.Outputs.OperationsTableName
+    Export:
+      Name: !Sub '${AWS::StackName}-OperationsTable'
+
+  AIDecisionsTableName:
+    Description: 'Name of the AI Decisions DynamoDB table'
+    Value: !GetAtt DynamoDBStack.Outputs.AIDecisionsTableName
+    Export:
+      Name: !Sub '${AWS::StackName}-AIDecisionsTable'
+
+  CacheTableName:
+    Description: 'Name of the Cache DynamoDB table'
+    Value: !GetAtt DynamoDBStack.Outputs.CacheTableName
+    Export:
+      Name: !Sub '${AWS::StackName}-CacheTable'
+
+  # API Gateway Outputs
+  APIGatewayURL:
+    Condition: HasLambdaArns
+    Description: 'URL of the API Gateway'
+    Value: !GetAtt APIGatewayStack.Outputs.APIGatewayURL
+    Export:
+      Name: !Sub '${AWS::StackName}-APIGatewayURL'
+
+  RestAPIId:
+    Condition: HasLambdaArns
+    Description: 'ID of the REST API'
+    Value: !GetAtt APIGatewayStack.Outputs.RestAPIId
+    Export:
+      Name: !Sub '${AWS::StackName}-RestAPIId'
+
+  # CloudFront Outputs
+  CloudFrontURL:
+    Description: 'URL of the CloudFront distribution'
+    Value: !GetAtt CloudFrontStack.Outputs.CloudFrontDistributionURL
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontURL'
+
+  CloudFrontDistributionId:
+    Description: 'ID of the CloudFront distribution'
+    Value: !GetAtt CloudFrontStack.Outputs.CloudFrontDistributionId
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontDistributionId'

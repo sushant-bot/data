@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'DynamoDB tables for AI Data Analyst Platform - sessions, operations, AI decisions, and caching'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'ai-data-analyst-platform'
+    Description: 'Name of the project for resource naming'
+  
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name'
+
+Resources:
+  # Sessions Table - Store session metadata and workflow state
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-sessions-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: 'session_id'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'session_id'
+          KeyType: 'HASH'
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'Session Management'
+
+  # Operations Table - Log all preprocessing and training operations
+  OperationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-operations-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: 'session_id'
+          AttributeType: 'S'
+        - AttributeName: 'timestamp'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'session_id'
+          KeyType: 'HASH'
+        - AttributeName: 'timestamp'
+          KeyType: 'RANGE'
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: 'ttl'
+        Enabled: true
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'Operations Logging'
+
+  # AI Decisions Table - Store AI recommendations and reasoning
+  AIDecisionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-ai-decisions-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: 'session_id'
+          AttributeType: 'S'
+        - AttributeName: 'decision_type'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'session_id'
+          KeyType: 'HASH'
+        - AttributeName: 'decision_type'
+          KeyType: 'RANGE'
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: 'ttl'
+        Enabled: true
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'AI Decision Tracking'
+
+  # Cache Table - Cache AI responses for performance optimization
+  CacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-cache-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: 'prompt_hash'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'prompt_hash'
+          KeyType: 'HASH'
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: 'ttl'
+        Enabled: true
+      Tags:
+        - Key: 'Project'
+          Value: !Ref ProjectName
+        - Key: 'Environment'
+          Value: !Ref Environment
+        - Key: 'Purpose'
+          Value: 'AI Response Caching'
+
+Outputs:
+  SessionsTableName:
+    Description: 'Name of the Sessions DynamoDB table'
+    Value: !Ref SessionsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-SessionsTable'
+
+  SessionsTableArn:
+    Description: 'ARN of the Sessions DynamoDB table'
+    Value: !GetAtt SessionsTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SessionsTableArn'
+
+  OperationsTableName:
+    Description: 'Name of the Operations DynamoDB table'
+    Value: !Ref OperationsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-OperationsTable'
+
+  OperationsTableArn:
+    Description: 'ARN of the Operations DynamoDB table'
+    Value: !GetAtt OperationsTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OperationsTableArn'
+
+  AIDecisionsTableName:
+    Description: 'Name of the AI Decisions DynamoDB table'
+    Value: !Ref AIDecisionsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-AIDecisionsTable'
+
+  AIDecisionsTableArn:
+    Description: 'ARN of the AI Decisions DynamoDB table'
+    Value: !GetAtt AIDecisionsTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AIDecisionsTableArn'
+
+  CacheTableName:
+    Description: 'Name of the Cache DynamoDB table'
+    Value: !Ref CacheTable
+    Export:
+      Name: !Sub '${AWS::StackName}-CacheTable'
+
+  CacheTableArn:
+    Description: 'ARN of the Cache DynamoDB table'
+    Value: !GetAtt CacheTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CacheTableArn'
