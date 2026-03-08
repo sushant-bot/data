@@ -26,6 +26,7 @@ import {
   Delete as DeleteIcon,
   PlayArrow as RunIcon,
   CheckCircle as DoneIcon,
+  Download as DownloadIcon,
 } from '@mui/icons-material';
 import { preprocess, getPreview } from '../services/api';
 import type { PreprocessOperation, PreprocessResponse } from '../types';
@@ -233,9 +234,29 @@ export default function Preprocessing({ sessionId }: PreprocessingProps) {
       {loading && <LinearProgress sx={{ borderRadius: 1, mb: 2 }} />}
       {error && <Alert severity="error" sx={{ borderRadius: 2 }}>{error}</Alert>}
       {result && (
-        <Alert icon={<DoneIcon />} severity="success" sx={{ borderRadius: 2 }}>
-          Preprocessing complete — {result.operations_applied} operation(s) applied.
-        </Alert>
+        <Box>
+          <Alert icon={<DoneIcon />} severity="success" sx={{ borderRadius: 2, mb: 2 }}>
+            Preprocessing complete — {result.operations_applied ?? result.operations_completed ?? 0} operation(s) applied.
+          </Alert>
+          {result.download_url && (
+            <Button
+              variant="outlined"
+              startIcon={<DownloadIcon />}
+              component="a"
+              href={result.download_url}
+              download="processed_data.csv"
+              sx={{
+                borderRadius: 2,
+                textTransform: 'none',
+                borderColor: '#6366f1',
+                color: '#6366f1',
+                '&:hover': { borderColor: '#4f46e5', bgcolor: '#eef2ff' },
+              }}
+            >
+              Download Processed Data
+            </Button>
+          )}
+        </Box>
       )}
     </Box>
   );

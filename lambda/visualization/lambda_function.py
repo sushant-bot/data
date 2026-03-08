@@ -81,12 +81,26 @@ def lambda_handler(event, context):
         elif visualization_type == 'cluster_plot':
             visualization_key = generate_cluster_plot_viz(session_id, dataset, parameters)
         elif visualization_type == 'feature_importance':
+            parameters['_session_id'] = session_id
             visualization_key = generate_feature_importance_viz(session_id, parameters)
         else:
             return {
                 'statusCode': 400,
                 'headers': CORS_HEADERS,
                 'body': json.dumps({'error': f'Unsupported visualization type: {visualization_type}'})
+            }
+        
+        # Types that strictly require ML training results
+        ML_DEPENDENT_TYPES = {'confusion_matrix', 'roc_curve'}
+        
+        if not visualization_key and visualization_type in ML_DEPENDENT_TYPES:
+            return {
+                'statusCode': 400,
+                'headers': CORS_HEADERS,
+                'body': json.dumps({
+                    'error': f'{visualization_type.replace("_", " ").title()} requires ML model training first. '
+                             f'Please train a model in the ML Training tab before generating this visualization.'
+                })
             }
         
         if not visualization_key:
@@ -124,7 +138,7 @@ def lambda_handler(event, context):
         }
 
 def load_dataset(session_id: str, dataset_type: str = 'processed') -> Optional[pd.DataFrame]:
-    """Load dataset from S3."""
+    """Load dataset from S3, falling back to original if processed is not found."""
     try:
         if dataset_type == 'original':
             key = f"datasets/{session_id}/original.csv"
@@ -135,7 +149,13 @@ def load_dataset(session_id: str, dataset_type: str = 'processed') -> Optional[p
         csv_content = response['Body'].read().decode('utf-8')
         return pd.read_csv(io.StringIO(csv_content))
     except Exception as e:
-        logger.error(f"Error loading dataset: {str(e)}")
+        error_str = str(e)
+        is_not_found = 'NoSuchKey' in error_str or 'Not Found' in error_str or '404' in error_str
+        if is_not_found and dataset_type != 'original':
+            logger.info(f"Processed dataset not found, falling back to original")
+            return load_dataset(session_id, 'original')
+        logger.error(f"Error loading dataset: {error_str}")
+        return None
         return None
 
 def generate_correlation_heatmap(session_id: str, dataset: pd.DataFrame, 
@@ -183,6 +203,11 @@ def generate_correlation_heatmap(session_id: str, dataset: pd.DataFrame,
 def generate_confusion_matrix_viz(session_id: str, parameters: Dict[str, Any]) -> Optional[str]:
     """Generate confusion matrix visualization from ML results."""
     try:
+        # Try to retrieve stored visualization from ML training results
+        stored_key = get_stored_visualization(session_id, 'confusion_matrix')
+        if stored_key:
+            return stored_key
+
         # Load ML results from DynamoDB
         ml_results = load_ml_results(session_id, 'supervised')
         if not ml_results:
@@ -229,6 +254,11 @@ def generate_confusion_matrix_viz(session_id: str, parameters: Dict[str, Any]) -
 def generate_roc_curve_viz(session_id: str, parameters: Dict[str, Any]) -> Optional[str]:
     """Generate ROC curve visualization."""
     try:
+        # Try to retrieve stored visualization from ML training results
+        stored_key = get_stored_visualization(session_id, 'roc_curve')
+        if stored_key:
+            return stored_key
+
         from sklearn.metrics import roc_curve, auc
         
         # Extract ROC curve data from parameters
@@ -273,22 +303,44 @@ def generate_cluster_plot_viz(session_id: str, dataset: pd.DataFrame,
                             parameters: Dict[str, Any]) -> Optional[str]:
     """Generate cluster plot visualization."""
     try:
-        # Extract clustering parameters
+        # Try to retrieve stored visualization from ML training results
+        stored_key = get_stored_visualization(session_id, 'cluster_plot')
+        if stored_key:
+            return stored_key
+
+        # Get numeric columns for clustering
+        numeric_columns = dataset.select_dtypes(include=[np.number]).columns.tolist()
+        if len(numeric_columns) < 2:
+            logger.warning("Not enough numeric features for cluster plot")
+            return None
+
+        # Extract clustering parameters or auto-generate
         labels = parameters.get('labels')
         feature_columns = parameters.get('feature_columns', [])
         cluster_centers = parameters.get('cluster_centers')
-        
-        if labels is None:
-            logger.warning("Missing cluster labels for cluster plot")
-            return None
-        
-        # Use first two features for 2D visualization
-        if len(feature_columns) < 2:
-            numeric_columns = dataset.select_dtypes(include=[np.number]).columns.tolist()
-            if len(numeric_columns) < 2:
-                logger.warning("Not enough numeric features for cluster plot")
-                return None
+
+        if not feature_columns or len(feature_columns) < 2:
             feature_columns = numeric_columns[:2]
+
+        # If no labels provided, auto-run KMeans clustering
+        if labels is None:
+            from sklearn.cluster import KMeans
+            from sklearn.preprocessing import StandardScaler
+            n_clusters = parameters.get('n_clusters', 3)
+            X = dataset[numeric_columns].dropna()
+            if len(X) < n_clusters:
+                logger.warning("Not enough data points for clustering")
+                return None
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X)
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            labels = kmeans.fit_predict(X_scaled)
+            # Transform centers back using the first 2 feature columns
+            cluster_centers = scaler.inverse_transform(kmeans.cluster_centers_)
+            # Use aligned index for plotting
+            plot_data = dataset.loc[X.index]
+        else:
+            plot_data = dataset
         
         x_col, y_col = feature_columns[0], feature_columns[1]
         
@@ -296,14 +348,17 @@ def generate_cluster_plot_viz(session_id: str, dataset: pd.DataFrame,
         
         # Create scatter plot
         scatter = plt.scatter(
-            dataset[x_col], dataset[y_col], 
+            plot_data[x_col], plot_data[y_col], 
             c=labels, cmap='viridis', alpha=0.7, s=50
         )
         
         # Plot cluster centers if available
         if cluster_centers is not None:
+            x_idx = numeric_columns.index(x_col) if x_col in numeric_columns else 0
+            y_idx = numeric_columns.index(y_col) if y_col in numeric_columns else 1
             plt.scatter(
-                cluster_centers[:, 0], cluster_centers[:, 1],
+                [c[x_idx] for c in cluster_centers],
+                [c[y_idx] for c in cluster_centers],
                 c='red', marker='x', s=200, linewidths=3, 
                 label='Centroids'
             )
@@ -327,15 +382,36 @@ def generate_cluster_plot_viz(session_id: str, dataset: pd.DataFrame,
         return None
 
 def generate_feature_importance_viz(session_id: str, parameters: Dict[str, Any]) -> Optional[str]:
-    """Generate feature importance visualization."""
+    """Generate feature importance visualization from ML results or dataset variance."""
     try:
-        # Extract feature importance data
+        # Try to retrieve stored visualization from ML training results
+        stored_key = get_stored_visualization(session_id, 'feature_importance')
+        if stored_key:
+            return stored_key
+
+        # Extract feature importance data from parameters
         importances = parameters.get('importances')
         feature_names = parameters.get('feature_names')
         
+        # If no explicit importance data, compute variance-based importance from dataset
         if not importances or not feature_names:
-            logger.warning("Missing feature importance data")
-            return None
+            dataset_type = parameters.get('dataset_type', 'processed')
+            dataset = load_dataset(parameters.get('_session_id', ''), dataset_type)
+            if dataset is None:
+                logger.warning("No dataset available for feature importance")
+                return None
+            numeric_cols = dataset.select_dtypes(include=[np.number]).columns.tolist()
+            if len(numeric_cols) < 1:
+                logger.warning("No numeric columns for feature importance")
+                return None
+            # Use normalized variance as a proxy for feature importance
+            variances = dataset[numeric_cols].var()
+            total_var = variances.sum()
+            if total_var > 0:
+                importances = (variances / total_var).tolist()
+            else:
+                importances = [1.0 / len(numeric_cols)] * len(numeric_cols)
+            feature_names = numeric_cols
         
         # Sort features by importance
         indices = np.argsort(importances)[::-1]
@@ -404,13 +480,47 @@ def load_ml_results(session_id: str, result_type: str) -> Optional[Dict[str, Any
         )
 
         for item in response.get('Items', []):
-            if item.get('operation_type') == 'ml_training' and item.get('ml_type') == result_type:
+            if item.get('operation_type') == 'ml_results' and item.get('model_type') == result_type:
                 return item
 
         return None
 
     except Exception as e:
         logger.error(f"Error loading ML results: {str(e)}")
+        return None
+
+
+def get_stored_visualization(session_id: str, viz_type: str) -> Optional[str]:
+    """Retrieve a stored visualization key from ML training results."""
+    try:
+        # Check supervised results first
+        ml_results = load_ml_results(session_id, 'supervised')
+        if ml_results and ml_results.get('visualizations'):
+            for key in ml_results['visualizations']:
+                if viz_type in key:
+                    # Verify the object exists in S3
+                    try:
+                        s3_client.head_object(Bucket=BUCKET_NAME, Key=key)
+                        logger.info(f"Found stored {viz_type} visualization: {key}")
+                        return key
+                    except Exception:
+                        continue
+
+        # Check unsupervised results
+        ml_results = load_ml_results(session_id, 'unsupervised')
+        if ml_results and ml_results.get('visualizations'):
+            for key in ml_results['visualizations']:
+                if viz_type in key:
+                    try:
+                        s3_client.head_object(Bucket=BUCKET_NAME, Key=key)
+                        logger.info(f"Found stored {viz_type} visualization: {key}")
+                        return key
+                    except Exception:
+                        continue
+
+        return None
+    except Exception as e:
+        logger.error(f"Error retrieving stored visualization: {str(e)}")
         return None
 
 

@@ -67,8 +67,10 @@ export interface PreprocessRequest {
 
 export interface PreprocessResponse {
   session_id: string;
-  operations_applied: number;
-  processed_dataset_location: string;
+  operations_applied?: number;
+  operations_completed?: number;
+  processed_dataset_location?: string;
+  download_url?: string;
   operation_results: any[];
 }
 

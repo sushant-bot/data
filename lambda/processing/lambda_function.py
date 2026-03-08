@@ -181,6 +181,10 @@ def handle_preprocessing_operations(event, context):
             try:
                 start_time = datetime.utcnow()
                 
+                # Normalize operation format for logging
+                normalized = normalize_operation(operation)
+                action_name = normalized.get('type', operation.get('operation', 'unknown'))
+                
                 # Execute the preprocessing operation
                 processed_df, operation_result = execute_preprocessing_operation(
                     processed_df, operation
@@ -194,8 +198,8 @@ def handle_preprocessing_operations(event, context):
                     'session_id': session_id,
                     'timestamp': start_time.isoformat(),
                     'operation_type': 'preprocessing',
-                    'action': operation.get('type'),
-                    'parameters': operation.get('parameters', {}),
+                    'action': action_name,
+                    'parameters': normalized.get('parameters', {}),
                     'status': 'completed',
                     'duration_ms': duration_ms,
                     'rows_before': len(df),
@@ -211,18 +215,19 @@ def handle_preprocessing_operations(event, context):
                 operations_table = dynamodb.Table(OPERATIONS_TABLE)
                 operations_table.put_item(Item=operation_log)
                 
-                logger.info(f"Completed operation: {operation.get('type')}")
+                logger.info(f"Completed operation: {action_name}")
                 
             except Exception as e:
-                logger.error(f"Failed to execute operation {operation.get('type')}: {str(e)}")
+                logger.error(f"Failed to execute operation {operation.get('type', operation.get('operation'))}: {str(e)}")
                 
                 # Log failed operation
+                normalized = normalize_operation(operation)
                 operation_log = {
                     'session_id': session_id,
                     'timestamp': datetime.utcnow().isoformat(),
                     'operation_type': 'preprocessing',
-                    'action': operation.get('type'),
-                    'parameters': operation.get('parameters', {}),
+                    'action': normalized.get('type', operation.get('operation', 'unknown')),
+                    'parameters': normalized.get('parameters', {}),
                     'status': 'failed',
                     'error': str(e),
                     'rows_before': len(df),
@@ -270,11 +275,18 @@ def handle_preprocessing_operations(event, context):
         except Exception as e:
             logger.error(f"Failed to update session metadata: {str(e)}")
         
+        # Generate download URL for processed dataset
+        download_url = generate_presigned_url(processed_s3_key)
+
         # Return success response
+        operations_applied = len([op for op in operation_results if op['status'] == 'completed'])
         response_data = {
             'session_id': session_id,
-            'operations_completed': len([op for op in operation_results if op['status'] == 'completed']),
+            'operations_applied': operations_applied,
+            'operations_completed': operations_applied,
             'operations_failed': len([op for op in operation_results if op['status'] == 'failed']),
+            'processed_dataset_location': processed_s3_key,
+            'download_url': download_url,
             'processed_dataset': {
                 's3_key': processed_s3_key,
                 'shape': {
@@ -303,6 +315,40 @@ def handle_preprocessing_operations(event, context):
         return create_error_response(500, "Internal server error")
 
 
+def normalize_operation(operation: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize frontend operation format to backend format.
+    
+    Frontend sends: { operation: "handle_missing", method: "fill", columns: [...] }
+    Backend expects: { type: "null_filling", parameters: { strategy: "mean", columns: [...] } }
+    """
+    # If already in backend format, return as-is
+    if 'type' in operation and 'parameters' in operation:
+        return operation
+
+    op = operation.get('operation', '')
+    method = operation.get('method', '')
+    columns = operation.get('columns', [])
+    remove = operation.get('remove', False)
+
+    if op == 'handle_missing':
+        if method == 'drop':
+            return {'type': 'null_removal', 'parameters': {'method': 'drop_rows', 'columns': columns}}
+        else:
+            return {'type': 'null_filling', 'parameters': {'strategy': 'mean', 'columns': columns}}
+    elif op == 'detect_outliers':
+        return {'type': 'outlier_removal', 'parameters': {'method': method or 'iqr', 'remove': remove}}
+    elif op == 'scale_features':
+        return {'type': 'scaling', 'parameters': {'method': method or 'standard', 'columns': columns}}
+    elif op == 'encode_categorical':
+        if method == 'onehot':
+            return {'type': 'one_hot_encoding', 'parameters': {'columns': columns}}
+        else:
+            return {'type': 'label_encoding', 'parameters': {'columns': columns}}
+    else:
+        return operation
+
+
 def execute_preprocessing_operation(df: pd.DataFrame, operation: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Execute a single preprocessing operation on the dataset.
@@ -314,6 +360,7 @@ def execute_preprocessing_operation(df: pd.DataFrame, operation: Dict[str, Any])
     Returns:
         Tuple of (processed DataFrame, operation result details)
     """
+    operation = normalize_operation(operation)
     operation_type = operation.get('type')
     parameters = operation.get('parameters', {})
     
@@ -639,6 +686,20 @@ def handle_one_hot_encoding(df: pd.DataFrame, parameters: Dict[str, Any]) -> Tup
     }
     
     return processed_df, result_details
+
+
+def generate_presigned_url(s3_key: str, expiration: int = 3600) -> str:
+    """Generate a presigned URL for downloading the processed dataset."""
+    try:
+        url = s3_client.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': DATA_BUCKET, 'Key': s3_key},
+            ExpiresIn=expiration
+        )
+        return url
+    except Exception as e:
+        logger.error(f"Error generating presigned URL: {str(e)}")
+        return ""
 
 
 def create_error_response(status_code: int, message: str) -> Dict[str, Any]:

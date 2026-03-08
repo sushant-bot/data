@@ -140,7 +140,7 @@ class TestCorrelationVisualization:
         self.dynamodb_patcher.stop()
 
     @given(df=numerical_dataframe())
-    @settings(max_examples=20, deadline=2000)
+    @settings(max_examples=20, deadline=2000, suppress_health_check=[HealthCheck.data_too_large])
     def test_property_15_correlation_heatmap_generation(self, df):
         """
         Feature: ai-data-analyst-platform, Property 15: Correlation Calculation Accuracy
@@ -252,7 +252,7 @@ class TestVisualizationStorageAndRetrieval:
         self.s3_mock.put_object.assert_called_once()
         kwargs = self.s3_mock.put_object.call_args[1]
         assert kwargs['ContentType'] == 'image/png'
-        assert kwargs['Bucket'] == 'ai-data-analyst-bucket'
+        assert kwargs['Bucket'] == 'ai-data-analyst-platform-data-dev-077437903006'
 
     def test_property_16_presigned_url_generation(self):
         """Presigned URLs should be generated for visualization access."""
@@ -264,7 +264,7 @@ class TestVisualizationStorageAndRetrieval:
         assert url == expected_url
         self.s3_mock.generate_presigned_url.assert_called_once_with(
             'get_object',
-            Params={'Bucket': 'ai-data-analyst-bucket', 'Key': 'visualizations/session/chart.png'},
+            Params={'Bucket': 'ai-data-analyst-platform-data-dev-077437903006', 'Key': 'visualizations/session/chart.png'},
             ExpiresIn=3600
         )
 
@@ -365,9 +365,10 @@ class TestModelEvaluationVisualization:
 
         # Mock ML results lookup
         self.table_mock.query.return_value = {
-            'Items': [{'operation_type': 'ml_training', 'ml_type': 'supervised'}]
+            'Items': [{'operation_type': 'ml_results', 'model_type': 'supervised'}]
         }
         self.s3_mock.put_object.return_value = {}
+        self.s3_mock.head_object.side_effect = Exception("NoSuchKey")
 
         result = generate_confusion_matrix_viz(session_id, {
             'y_true': y_true,
@@ -577,15 +578,18 @@ class TestClusterPlotVisualization:
         assert result is not None
 
     def test_cluster_plot_requires_labels(self):
-        """Cluster plot should return None when labels are missing."""
+        """Cluster plot should auto-generate clusters when labels are missing."""
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
 
-        df = pd.DataFrame({'x': [1, 2, 3], 'y': [4, 5, 6]})
+        df = pd.DataFrame({'x': [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 'y': [4, 5, 6, 7, 8, 9, 10, 11, 12, 13]})
+        self.s3_mock.put_object.return_value = {}
+        self.s3_mock.head_object.side_effect = Exception("NoSuchKey")
         result = generate_cluster_plot_viz("test", df, {})
         plt.close('all')
-        assert result is None
+        assert result is not None
+        assert 'cluster_plot' in result
 
 
 class TestLambdaHandlerEdgeCases:
