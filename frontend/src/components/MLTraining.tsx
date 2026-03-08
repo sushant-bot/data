@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Box,
   Paper,
@@ -10,8 +10,6 @@ import {
   InputLabel,
   Alert,
   Grid,
-  Card,
-  CardContent,
   LinearProgress,
   Chip,
   OutlinedInput,
@@ -31,8 +29,8 @@ import {
   ModelTraining as TrainIcon,
   CheckCircle as DoneIcon,
 } from '@mui/icons-material';
-import { trainModel, getPreview } from '../services/api';
-import type { TrainResponse, Algorithm } from '../types';
+import { startTraining, checkTrainingStatus, getPreview } from '../services/api';
+import type { TrainStatusResponse, Algorithm } from '../types';
 
 interface MLTrainingProps {
   sessionId: string;
@@ -58,8 +56,9 @@ export default function MLTraining({ sessionId }: MLTrainingProps) {
   const [featureColumns, setFeatureColumns] = useState<string[]>([]);
   const [testSize, setTestSize] = useState('0.2');
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<TrainResponse | null>(null);
+  const [result, setResult] = useState<TrainStatusResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     getPreview(sessionId)
@@ -73,12 +72,42 @@ export default function MLTraining({ sessionId }: MLTrainingProps) {
     setFeatureColumns([]);
   }, [modelType]);
 
+  // Cleanup polling on unmount
+  useEffect(() => {
+    return () => {
+      if (pollingRef.current) clearInterval(pollingRef.current);
+    };
+  }, []);
+
+  const pollForResults = useCallback((opId: string) => {
+    pollingRef.current = setInterval(async () => {
+      try {
+        const status = await checkTrainingStatus(sessionId, opId);
+        if (status.status === 'completed') {
+          if (pollingRef.current) clearInterval(pollingRef.current);
+          pollingRef.current = null;
+          setResult(status);
+          setLoading(false);
+        } else if (status.status === 'failed') {
+          if (pollingRef.current) clearInterval(pollingRef.current);
+          pollingRef.current = null;
+          setError(status.error || 'Training failed');
+          setLoading(false);
+        }
+        // If still 'training', keep polling
+      } catch {
+        // Polling error - keep retrying silently
+      }
+    }, 3000);
+  }, [sessionId]);
+
   const handleTrain = async () => {
     setLoading(true);
     setError(null);
     setResult(null);
+    if (pollingRef.current) clearInterval(pollingRef.current);
     try {
-      const res = await trainModel({
+      const res = await startTraining({
         session_id: sessionId,
         model_type: modelType,
         algorithm,
@@ -86,10 +115,10 @@ export default function MLTraining({ sessionId }: MLTrainingProps) {
         feature_columns: featureColumns,
         parameters: { test_size: parseFloat(testSize), random_state: 42 },
       });
-      setResult(res);
+      // Start polling for results
+      pollForResults(res.operation_id);
     } catch (err: any) {
       setError(err?.response?.data?.error || err.message);
-    } finally {
       setLoading(false);
     }
   };
@@ -203,17 +232,24 @@ export default function MLTraining({ sessionId }: MLTrainingProps) {
         </Box>
       </Paper>
 
-      {loading && <LinearProgress sx={{ borderRadius: 1, mb: 2 }} />}
+      {loading && (
+        <Box sx={{ mb: 2 }}>
+          <LinearProgress sx={{ borderRadius: 1, mb: 1 }} />
+          <Typography variant="body2" color="text.secondary" sx={{ textAlign: 'center' }}>
+            Training in progress... This may take a moment.
+          </Typography>
+        </Box>
+      )}
       {error && <Alert severity="error" sx={{ borderRadius: 2, mb: 2 }}>{error}</Alert>}
 
       {/* Results */}
-      {result && (
+      {result && result.results && (
         <Paper elevation={0} sx={{ p: 3, border: '1px solid #e5e7eb', borderRadius: 2 }}>
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 2 }}>
             <DoneIcon sx={{ color: '#22c55e' }} />
             <Typography variant="subtitle1" fontWeight={600}>Training Results</Typography>
             <Chip
-              label={result.algorithm.replace('_', ' ')}
+              label={(result.algorithm || '').replace('_', ' ')}
               size="small"
               sx={{ ml: 'auto', bgcolor: '#eef2ff', color: '#4338ca', textTransform: 'capitalize' }}
             />

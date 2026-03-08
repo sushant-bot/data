@@ -144,6 +144,29 @@ export interface TrainRequest {
   parameters?: Record<string, any>;
 }
 
+export interface TrainStartResponse {
+  session_id: string;
+  operation_id: string;
+  status: 'training';
+  message: string;
+}
+
+export interface TrainStatusResponse {
+  session_id: string;
+  operation_id: string;
+  status: 'training' | 'completed' | 'failed';
+  model_type?: string;
+  algorithm?: string;
+  results?: {
+    metrics: Record<string, any>;
+    training_details: Record<string, any>;
+    visualizations: string[];
+    feature_columns: string[];
+    target_column?: string;
+  };
+  error?: string;
+}
+
 export interface TrainResponse {
   session_id: string;
   model_type: string;

@@ -221,6 +221,11 @@ def create_lambda_role(account_id):
                 "Effect": "Allow",
                 "Action": ["bedrock:InvokeModel", "bedrock:ApplyGuardrail"],
                 "Resource": "*"
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["lambda:InvokeFunction"],
+                "Resource": f"arn:aws:lambda:{AWS_REGION}:{account_id}:function:{PROJECT_NAME}-*-{ENVIRONMENT}"
             }
         ]
     })
@@ -442,7 +447,7 @@ def main():
     print("\n--- Creating Lambda Layers ---")
     data_layer_arn = create_layer(
         f"{PROJECT_NAME}-data-layer-{ENVIRONMENT}",
-        ["pandas==2.1.4", "numpy==1.24.3", "pytz"],
+        ["pandas==2.1.4", "numpy==1.25.2", "pytz"],
         account_id
     )
     ml_layer_arn = create_layer(

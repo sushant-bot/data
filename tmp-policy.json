@@ -1,0 +1,58 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:ListBucket",
+                "s3:DeleteObject"
+            ],
+            "Resource": [
+                "arn:aws:s3:::ai-data-analyst-platform-data-dev-077437903006",
+                "arn:aws:s3:::ai-data-analyst-platform-data-dev-077437903006/*"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "dynamodb:GetItem",
+                "dynamodb:PutItem",
+                "dynamodb:UpdateItem",
+                "dynamodb:Query",
+                "dynamodb:Scan"
+            ],
+            "Resource": [
+                "arn:aws:dynamodb:us-east-1:077437903006:table/ai-data-analyst-platform-sessions-dev",
+                "arn:aws:dynamodb:us-east-1:077437903006:table/ai-data-analyst-platform-sessions-dev/*",
+                "arn:aws:dynamodb:us-east-1:077437903006:table/ai-data-analyst-platform-operations-dev",
+                "arn:aws:dynamodb:us-east-1:077437903006:table/ai-data-analyst-platform-operations-dev/*",
+                "arn:aws:dynamodb:us-east-1:077437903006:table/ai-data-analyst-platform-ai-decisions-dev",
+                "arn:aws:dynamodb:us-east-1:077437903006:table/ai-data-analyst-platform-ai-decisions-dev/*",
+                "arn:aws:dynamodb:us-east-1:077437903006:table/ai-data-analyst-platform-cache-dev",
+                "arn:aws:dynamodb:us-east-1:077437903006:table/ai-data-analyst-platform-cache-dev/*"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "bedrock:InvokeModel",
+                "bedrock:ApplyGuardrail"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "lambda:InvokeFunction"
+            ],
+            "Resource": [
+                "arn:aws:lambda:us-east-1:077437903006:function:ai-data-analyst-platform-ml-training-dev",
+                "arn:aws:lambda:us-east-1:077437903006:function:ai-data-analyst-platform-ml-training-dev:*",
+                "arn:aws:lambda:us-east-1:077437903006:function:ai-data-analyst-platform-*-dev",
+                "arn:aws:lambda:us-east-1:077437903006:function:ai-data-analyst-platform-*-dev:*"
+            ]
+        }
+    ]
+}

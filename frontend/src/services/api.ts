@@ -7,6 +7,8 @@ import type {
   QualityResponse,
   TrainRequest,
   TrainResponse,
+  TrainStartResponse,
+  TrainStatusResponse,
   VisualizationRequest,
   VisualizationResponse,
   RecommendationsResponse,
@@ -48,7 +50,22 @@ export async function getQuality(sessionId: string): Promise<QualityResponse> {
   return data;
 }
 
-// Train
+// Train (async pattern)
+export async function startTraining(req: TrainRequest): Promise<TrainStartResponse> {
+  const { data } = await api.post<TrainStartResponse>('/train', req);
+  return data;
+}
+
+export async function checkTrainingStatus(sessionId: string, operationId: string): Promise<TrainStatusResponse> {
+  const { data } = await api.post<TrainStatusResponse>('/train', {
+    action: 'check_status',
+    session_id: sessionId,
+    operation_id: operationId,
+  });
+  return data;
+}
+
+// Train (legacy sync - kept for backwards compatibility)
 export async function trainModel(req: TrainRequest): Promise<TrainResponse> {
   const { data } = await api.post<TrainResponse>('/train', req);
   return data;

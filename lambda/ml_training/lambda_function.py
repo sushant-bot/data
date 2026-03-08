@@ -22,10 +22,21 @@ from sklearn.metrics import (
     confusion_matrix, roc_curve, auc, silhouette_score
 )
 from sklearn.preprocessing import LabelEncoder
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
-import matplotlib.pyplot as plt
-import seaborn as sns
+
+# Lazy imports for matplotlib/seaborn (loaded only when generating visualizations)
+plt = None
+sns = None
+
+def _ensure_matplotlib():
+    """Lazily import matplotlib and seaborn to avoid import errors when not in layer."""
+    global plt, sns
+    if plt is None:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as _plt
+        import seaborn as _sns
+        plt = _plt
+        sns = _sns
 
 # Configure logging
 logger = logging.getLogger()
@@ -33,6 +44,7 @@ logger.setLevel(logging.INFO)
 
 # Initialize AWS clients
 s3_client = boto3.client('s3')
+lambda_client = boto3.client('lambda')
 dynamodb = boto3.resource('dynamodb')
 
 # Environment variables
@@ -50,82 +62,28 @@ CORS_HEADERS = {
 def lambda_handler(event, context):
     """
     Main Lambda handler for ML training operations.
-    Supports both supervised and unsupervised learning.
+    Supports async training pattern to avoid API Gateway 29s timeout.
+
+    Three modes:
+    1. Start training (default): validates input, stores pending status, invokes self async, returns operation_id
+    2. Async execution (_async_training=True): performs actual training, stores results
+    3. Check status (action='check_status'): returns current training status/results from DynamoDB
     """
     try:
-        # Parse request
+        # Check if this is an async invocation (no 'body' key from API Gateway)
+        if event.get('_async_training'):
+            return _execute_training(event)
+
+        # Parse request from API Gateway
         body = json.loads(event['body']) if isinstance(event.get('body'), str) else event.get('body', {})
-        session_id = body.get('session_id')
-        model_type = body.get('model_type')  # 'supervised' or 'unsupervised'
-        algorithm = body.get('algorithm')
-        target_column = body.get('target_column')  # For supervised learning
-        feature_columns = body.get('feature_columns', [])
-        parameters = body.get('parameters', {})
-        
-        if not session_id or not model_type or not algorithm:
-            return {
-                'statusCode': 400,
-                'headers': CORS_HEADERS,
-                'body': json.dumps({
-                    'error': 'Missing required parameters: session_id, model_type, algorithm'
-                })
-            }
-        
-        logger.info(f"Starting ML training for session {session_id}, type: {model_type}, algorithm: {algorithm}")
-        
-        # Load processed dataset
-        dataset = load_processed_dataset(session_id)
-        if dataset is None:
-            return {
-                'statusCode': 404,
-                'headers': CORS_HEADERS,
-                'body': json.dumps({'error': 'Processed dataset not found'})
-            }
-        
-        # Log operation start
-        operation_id = str(uuid.uuid4())
-        log_operation(session_id, operation_id, 'ml_training', 'started', {
-            'model_type': model_type,
-            'algorithm': algorithm,
-            'target_column': target_column,
-            'feature_columns': feature_columns
-        })
-        
-        # Perform ML training based on type
-        if model_type == 'supervised':
-            result = train_supervised_model(dataset, algorithm, target_column, feature_columns, parameters)
-        elif model_type == 'unsupervised':
-            result = train_unsupervised_model(dataset, algorithm, feature_columns, parameters)
-        else:
-            return {
-                'statusCode': 400,
-                'headers': CORS_HEADERS,
-                'body': json.dumps({'error': f'Invalid model_type: {model_type}'})
-            }
-        
-        # Store results
-        store_ml_results(session_id, result)
-        
-        # Log operation completion
-        log_operation(session_id, operation_id, 'ml_training', 'completed', {
-            'model_type': model_type,
-            'algorithm': algorithm,
-            'metrics': result.get('metrics', {})
-        })
-        
-        logger.info(f"ML training completed for session {session_id}")
-        
-        return {
-            'statusCode': 200,
-            'headers': CORS_HEADERS,
-            'body': json.dumps({
-                'session_id': session_id,
-                'model_type': model_type,
-                'algorithm': algorithm,
-                'results': result
-            })
-        }
-        
+
+        # Check if this is a status check request
+        if body.get('action') == 'check_status':
+            return _check_training_status(body)
+
+        # Otherwise, start a new training job
+        return _start_training(body, context)
+
     except Exception as e:
         logger.error(f"Error in ML training: {str(e)}")
         return {
@@ -133,6 +91,212 @@ def lambda_handler(event, context):
             'headers': CORS_HEADERS,
             'body': json.dumps({'error': f'Internal server error: {str(e)}'})
         }
+
+
+def _start_training(body, context):
+    """Validate request, store pending status, invoke self asynchronously, and return immediately."""
+    session_id = body.get('session_id')
+    model_type = body.get('model_type')
+    algorithm = body.get('algorithm')
+    target_column = body.get('target_column')
+    feature_columns = body.get('feature_columns', [])
+    parameters = body.get('parameters', {})
+
+    if not session_id or not model_type or not algorithm:
+        return {
+            'statusCode': 400,
+            'headers': CORS_HEADERS,
+            'body': json.dumps({
+                'error': 'Missing required parameters: session_id, model_type, algorithm'
+            })
+        }
+
+    logger.info(f"Starting async ML training for session {session_id}, type: {model_type}, algorithm: {algorithm}")
+
+    # Generate operation ID
+    operation_id = str(uuid.uuid4())
+
+    # Store initial "training" status in DynamoDB
+    operations_table = dynamodb.Table(OPERATIONS_TABLE)
+    operations_table.put_item(Item={
+        'session_id': session_id,
+        'timestamp': f"ml_training_{operation_id}",
+        'operation_id': operation_id,
+        'operation_type': 'ml_training',
+        'status': 'training',
+        'model_type': model_type,
+        'algorithm': algorithm,
+        'target_column': target_column,
+        'feature_columns': feature_columns,
+        'parameters': convert_floats_to_decimal(parameters),
+        'created_at': datetime.now().isoformat(),
+    })
+
+    # Invoke self asynchronously for the actual training
+    async_payload = {
+        '_async_training': True,
+        'session_id': session_id,
+        'operation_id': operation_id,
+        'model_type': model_type,
+        'algorithm': algorithm,
+        'target_column': target_column,
+        'feature_columns': feature_columns,
+        'parameters': parameters,
+    }
+
+    function_name = context.function_name
+    lambda_client.invoke(
+        FunctionName=function_name,
+        InvocationType='Event',  # Async invocation
+        Payload=json.dumps(async_payload),
+    )
+
+    logger.info(f"Async training invoked for operation {operation_id}")
+
+    return {
+        'statusCode': 202,
+        'headers': CORS_HEADERS,
+        'body': json.dumps({
+            'session_id': session_id,
+            'operation_id': operation_id,
+            'status': 'training',
+            'message': 'Training started. Poll with action=check_status to get results.',
+        })
+    }
+
+
+def _check_training_status(body):
+    """Check the status of a training operation from DynamoDB."""
+    session_id = body.get('session_id')
+    operation_id = body.get('operation_id')
+
+    if not session_id or not operation_id:
+        return {
+            'statusCode': 400,
+            'headers': CORS_HEADERS,
+            'body': json.dumps({'error': 'Missing session_id or operation_id'})
+        }
+
+    operations_table = dynamodb.Table(OPERATIONS_TABLE)
+
+    # Fetch the training record
+    response = operations_table.get_item(Key={
+        'session_id': session_id,
+        'timestamp': f"ml_training_{operation_id}",
+    })
+
+    item = response.get('Item')
+    if not item:
+        return {
+            'statusCode': 404,
+            'headers': CORS_HEADERS,
+            'body': json.dumps({'error': 'Training operation not found'})
+        }
+
+    status = item.get('status', 'unknown')
+
+    result = {
+        'session_id': session_id,
+        'operation_id': operation_id,
+        'status': status,
+        'model_type': item.get('model_type'),
+        'algorithm': item.get('algorithm'),
+    }
+
+    if status == 'completed':
+        result['results'] = {
+            'metrics': convert_decimals_to_floats(item.get('metrics', {})),
+            'training_details': convert_decimals_to_floats(item.get('training_details', {})),
+            'visualizations': item.get('visualizations', []),
+            'feature_columns': item.get('feature_columns', []),
+            'target_column': item.get('target_column'),
+        }
+    elif status == 'failed':
+        result['error'] = item.get('error_message', 'Training failed')
+
+    return {
+        'statusCode': 200,
+        'headers': CORS_HEADERS,
+        'body': json.dumps(result, default=str)
+    }
+
+
+def _execute_training(event):
+    """Perform the actual ML training (called asynchronously)."""
+    session_id = event['session_id']
+    operation_id = event['operation_id']
+    model_type = event['model_type']
+    algorithm = event['algorithm']
+    target_column = event.get('target_column')
+    feature_columns = event.get('feature_columns', [])
+    parameters = event.get('parameters', {})
+
+    operations_table = dynamodb.Table(OPERATIONS_TABLE)
+
+    try:
+        logger.info(f"Executing training for operation {operation_id}, session {session_id}")
+
+        # Load processed dataset
+        dataset = load_processed_dataset(session_id)
+        if dataset is None:
+            operations_table.update_item(
+                Key={'session_id': session_id, 'timestamp': f"ml_training_{operation_id}"},
+                UpdateExpression='SET #s = :s, error_message = :e',
+                ExpressionAttributeNames={'#s': 'status'},
+                ExpressionAttributeValues={':s': 'failed', ':e': 'Processed dataset not found'},
+            )
+            return
+
+        # Perform ML training based on type
+        if model_type == 'supervised':
+            result = train_supervised_model(dataset, algorithm, target_column, feature_columns, parameters)
+        elif model_type == 'unsupervised':
+            result = train_unsupervised_model(dataset, algorithm, feature_columns, parameters)
+        else:
+            operations_table.update_item(
+                Key={'session_id': session_id, 'timestamp': f"ml_training_{operation_id}"},
+                UpdateExpression='SET #s = :s, error_message = :e',
+                ExpressionAttributeNames={'#s': 'status'},
+                ExpressionAttributeValues={':s': 'failed', ':e': f'Invalid model_type: {model_type}'},
+            )
+            return
+
+        # Store results in the operation record
+        operations_table.update_item(
+            Key={'session_id': session_id, 'timestamp': f"ml_training_{operation_id}"},
+            UpdateExpression='SET #s = :s, metrics = :m, visualizations = :v, training_details = :td, completed_at = :ca',
+            ExpressionAttributeNames={'#s': 'status'},
+            ExpressionAttributeValues={
+                ':s': 'completed',
+                ':m': convert_floats_to_decimal(result.get('metrics', {})),
+                ':v': result.get('visualizations', []),
+                ':td': convert_floats_to_decimal({
+                    'model_type': result.get('model_type'),
+                    'algorithm': result.get('algorithm'),
+                    'feature_columns': result.get('feature_columns', []),
+                    'target_column': result.get('target_column'),
+                    'n_clusters': result.get('n_clusters'),
+                }),
+                ':ca': datetime.now().isoformat(),
+            },
+        )
+
+        # Also store in the original ml_results format for backwards compatibility
+        store_ml_results(session_id, result)
+
+        logger.info(f"Training completed for operation {operation_id}")
+
+    except Exception as e:
+        logger.error(f"Training failed for operation {operation_id}: {str(e)}")
+        try:
+            operations_table.update_item(
+                Key={'session_id': session_id, 'timestamp': f"ml_training_{operation_id}"},
+                UpdateExpression='SET #s = :s, error_message = :e',
+                ExpressionAttributeNames={'#s': 'status'},
+                ExpressionAttributeValues={':s': 'failed', ':e': str(e)},
+            )
+        except Exception as update_err:
+            logger.error(f"Failed to update operation status: {str(update_err)}")
 
 def load_processed_dataset(session_id: str) -> Optional[pd.DataFrame]:
     """Load processed dataset from S3."""
@@ -337,7 +501,8 @@ def generate_supervised_visualizations(y_true, y_pred, y_pred_proba, feature_col
                                      model, algorithm) -> List[str]:
     """Generate visualizations for supervised learning results."""
     visualizations = []
-    
+    _ensure_matplotlib()
+
     try:
         # Confusion Matrix
         cm = confusion_matrix(y_true, y_pred)
@@ -396,7 +561,8 @@ def generate_unsupervised_visualizations(X, labels, feature_columns, algorithm,
                                        cluster_centers=None) -> List[str]:
     """Generate visualizations for unsupervised learning results."""
     visualizations = []
-    
+    _ensure_matplotlib()
+
     try:
         # Cluster Plot (2D projection using first two features)
         if len(feature_columns) >= 2:
@@ -450,6 +616,7 @@ def generate_unsupervised_visualizations(X, labels, feature_columns, algorithm,
 
 def save_plot_to_s3(plot_type: str, algorithm: str) -> str:
     """Save matplotlib plot to S3 and return the key."""
+    _ensure_matplotlib()
     try:
         # Generate unique filename
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -522,21 +689,14 @@ def convert_floats_to_decimal(obj):
         return int(obj)
     return obj
 
-def log_operation(session_id: str, operation_id: str, operation_type: str,
-                 status: str, details: Dict[str, Any]):
-    """Log operation to DynamoDB."""
-    try:
-        operations_table = dynamodb.Table(OPERATIONS_TABLE)
 
-        item = {
-            'session_id': session_id,
-            'timestamp': datetime.now().isoformat(),
-            'operation_id': operation_id,
-            'operation_type': operation_type,
-            'status': status,
-            'details': convert_floats_to_decimal(details)
-        }
-        operations_table.put_item(Item=item)
-
-    except Exception as e:
-        logger.error(f"Error logging operation: {str(e)}")
+def convert_decimals_to_floats(obj):
+    """Recursively convert Decimal values back to floats for JSON serialization."""
+    from decimal import Decimal
+    if isinstance(obj, Decimal):
+        return float(obj)
+    elif isinstance(obj, dict):
+        return {k: convert_decimals_to_floats(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_decimals_to_floats(i) for i in obj]
+    return obj
