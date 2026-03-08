@@ -21,7 +21,7 @@ dynamodb = boto3.resource('dynamodb', region_name=aws_region)
 bedrock_client = boto3.client('bedrock-runtime', region_name=aws_region)
 
 # Environment variables
-DATA_BUCKET = os.environ.get('DATA_BUCKET', 'ai-data-analyst-platform-data-dev-077437903006')
+DATA_BUCKET = os.environ.get('DATA_BUCKET', 'ai-data-analyst-platform-data-dev-672627895253')
 SESSIONS_TABLE = os.environ.get('SESSIONS_TABLE', 'ai-data-analyst-platform-sessions-dev')
 
 def lambda_handler(event, context):
@@ -92,7 +92,7 @@ def lambda_handler(event, context):
         # Store session metadata in DynamoDB
         session_metadata = {
             'session_id': session_id,
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
             'dataset_name': file_name,
             'file_size': len(file_data),
             'row_count': stats['row_count'],

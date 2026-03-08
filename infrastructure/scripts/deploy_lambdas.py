@@ -46,6 +46,11 @@ def run(cmd, capture=False):
         sys.exit(1)
 
 
+def fpath(p):
+    """Convert Windows backslash path to forward slashes for AWS CLI file:// URIs."""
+    return p.replace("\\", "/")
+
+
 def get_account_id():
     return run("aws sts get-caller-identity --query Account --output text", capture=True)
 
@@ -145,7 +150,11 @@ def create_layer(layer_name, packages, account_id, exclude_pkgs=None):
     zip_mb = os.path.getsize(zip_path) / (1024 * 1024)
     print(f"  ZIP size: {zip_mb:.1f} MB")
 
-    # Upload to S3 and publish layer
+    if zip_mb < 0.001:
+        print(f"  WARNING: Layer zip is empty (packages failed to install). Skipping layer publish.")
+        shutil.rmtree(build_dir)
+        os.remove(zip_path)
+        return None
     s3_bucket = f"{PROJECT_NAME}-data-{ENVIRONMENT}-{account_id}"
     s3_key = f"lambda-layers/{layer_name}.zip"
     print(f"  Uploading layer to S3...")
@@ -187,9 +196,14 @@ def create_lambda_role(account_id):
         }]
     })
 
+    # Write trust policy to temp file to avoid shell quoting issues on Windows
+    trust_policy_file = os.path.join(PROJECT_ROOT, "tmp-trust-policy.json")
+    with open(trust_policy_file, "w") as f:
+        f.write(trust_policy)
     run(f'aws iam create-role --role-name {role_name} '
-        f'--assume-role-policy-document \'{trust_policy}\' '
+        f'--assume-role-policy-document "file://{fpath(trust_policy_file)}" '
         f'--output text --query Role.Arn')
+    os.remove(trust_policy_file)
 
     role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
 
@@ -233,7 +247,7 @@ def create_lambda_role(account_id):
 
     run(f'aws iam put-role-policy --role-name {role_name} '
         f'--policy-name {policy_name} '
-        f'--policy-document file://{policy_file}')
+        f'--policy-document "file://{fpath(policy_file)}"')
 
     os.remove(policy_file)
 
@@ -363,19 +377,21 @@ def deploy_function(func, role_arn, account_id, layer_arns=None):
     zip_size = os.path.getsize(zip_path)
     layers_arg = ""
     if layer_arns:
-        layers_arg = f'--layers {" ".join(layer_arns)}'
+        valid_arns = [a for a in layer_arns if a]
+        if valid_arns:
+            layers_arg = f'--layers {" ".join(valid_arns)}'
 
     if exists and "FunctionArn" in exists:
         print(f"  Updating existing function...")
         run(f'aws lambda update-function-code --function-name {func_name} '
-            f'--zip-file fileb://{zip_path} --region {AWS_REGION} --output text --query FunctionArn')
+            f'--zip-file "fileb://{fpath(zip_path)}" --region {AWS_REGION} --output text --query FunctionArn')
 
         # Wait for code update
         run(f'aws lambda wait function-updated-v2 --function-name {func_name} --region {AWS_REGION}', capture=True)
 
         run(f'aws lambda update-function-configuration --function-name {func_name} '
             f'--memory-size {func["memory"]} --timeout {func["timeout"]} '
-            f'--environment file://{env_file} {layers_arg} --region {AWS_REGION} --output text --query FunctionArn')
+            f'--environment "file://{fpath(env_file)}" {layers_arg} --region {AWS_REGION} --output text --query FunctionArn')
     else:
         print(f"  Creating new function...")
 
@@ -391,15 +407,15 @@ def deploy_function(func, role_arn, account_id, layer_arns=None):
                 f'--handler lambda_function.lambda_handler '
                 f'--memory-size {func["memory"]} --timeout {func["timeout"]} '
                 f'--code {code_arg} '
-                f'--environment file://{env_file} {layers_arg} '
+                f'--environment "file://{fpath(env_file)}" {layers_arg} '
                 f'--region {AWS_REGION} --output text --query FunctionArn')
         else:
             run(f'aws lambda create-function --function-name {func_name} '
                 f'--runtime python3.11 --role "{role_arn}" '
                 f'--handler lambda_function.lambda_handler '
                 f'--memory-size {func["memory"]} --timeout {func["timeout"]} '
-                f'--zip-file fileb://{zip_path} '
-                f'--environment file://{env_file} {layers_arg} '
+                f'--zip-file "fileb://{fpath(zip_path)}" '
+                f'--environment "file://{env_file}" {layers_arg} '
                 f'--region {AWS_REGION} --output text --query FunctionArn')
 
     # Wait for function to be active
@@ -432,19 +448,26 @@ def main():
     print("\n--- Setting up IAM Role ---")
     role_arn = create_lambda_role(account_id)
 
-    # Create Lambda layers for heavy dependencies
-    # Lambda limit: 250MB total (code + layers) unzipped
-    # Layer 1: Data layer (pandas+numpy) ~100MB trimmed
-    # Layer 2: ML layer (scikit-learn+scipy) ~110MB trimmed  
-    # Total ~210MB + function code ~few KB = under 250MB
-    # Note: matplotlib won't fit in the 250MB total, so viz functions
-    # will use a separate deployment approach later if needed
-    print("\n--- Creating Lambda Layers ---")
-    data_layer_arn = create_layer(
-        f"{PROJECT_NAME}-data-layer-{ENVIRONMENT}",
-        ["pandas==2.1.4", "numpy==1.24.3", "pytz"],
-        account_id
+    # Use AWS-provided pandas layer (AWSSDKPandas-Python311) instead of building our own
+    # This avoids Windows cross-compilation issues and is the recommended approach
+    print("\n--- Resolving Lambda Layers ---")
+    aws_pandas_layer = run(
+        f'aws lambda list-layers --region {AWS_REGION} --compatible-runtime python3.11 '
+        f'--query "Layers[?LayerName==\'AWSSDKPandas-Python311\'].LatestMatchingVersion.LayerVersionArn | [0]" '
+        f'--output text',
+        capture=True
     )
+    if aws_pandas_layer and aws_pandas_layer != 'None':
+        print(f"  Found AWS pandas layer: {aws_pandas_layer}")
+        data_layer_arn = aws_pandas_layer
+    else:
+        print("  AWS pandas layer not found, building custom data layer...")
+        data_layer_arn = create_layer(
+            f"{PROJECT_NAME}-data-layer-{ENVIRONMENT}",
+            ["pandas==2.1.4", "numpy==1.24.3", "pytz"],
+            account_id
+        )
+
     ml_layer_arn = create_layer(
         f"{PROJECT_NAME}-ml-layer-{ENVIRONMENT}",
         ["scikit-learn==1.3.2", "joblib", "threadpoolctl"],

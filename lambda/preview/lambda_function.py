@@ -17,57 +17,155 @@ s3_client = boto3.client('s3', region_name=aws_region)
 dynamodb = boto3.resource('dynamodb', region_name=aws_region)
 
 # Environment variables
-DATA_BUCKET = os.environ.get('DATA_BUCKET', 'ai-data-analyst-platform-data-dev-077437903006')
+DATA_BUCKET = os.environ.get('DATA_BUCKET', 'ai-data-analyst-platform-data-dev-672627895253')
 SESSIONS_TABLE = os.environ.get('SESSIONS_TABLE', 'ai-data-analyst-platform-sessions-dev')
 
 def lambda_handler(event, context):
     """
     Main Lambda handler for dataset preview and statistics generation.
-    
+
     Handles:
-    - Dataset preview generation (first 10 rows)
+    - Paginated dataset preview (page / page_size query params)
+    - Original or processed dataset selection (dataset_type query param)
+    - Presigned download URL generation (download query param: 'original' | 'processed')
     - Missing value detection and counting per column
     - Statistical summaries for numerical columns
     """
     try:
         logger.info(f"Preview Lambda invoked with event: {json.dumps(event, default=str)}")
-        
+
         # Extract session ID from path parameters
         session_id = event.get('pathParameters', {}).get('sessionId')
-        
+
         if not session_id:
             return create_error_response(400, "Missing session ID")
-        
+
+        # Parse query string parameters
+        query_params = event.get('queryStringParameters') or {}
+        page = int(query_params.get('page', 1))
+        page_size = min(int(query_params.get('page_size', 15)), 100)  # cap at 100
+        dataset_type = query_params.get('dataset_type', 'original')   # 'original' | 'processed'
+        download_target = query_params.get('download')                 # 'original' | 'processed' | None
+        download_format = query_params.get('format', 'csv')           # 'csv' | 'json'
+
         # Get session metadata from DynamoDB
         try:
             sessions_table = dynamodb.Table(SESSIONS_TABLE)
             response = sessions_table.get_item(Key={'session_id': session_id})
-            
+
             if 'Item' not in response:
                 return create_error_response(404, "Session not found")
-            
+
             session_data = response['Item']
-            s3_key = session_data['s3_key']
-            
+
         except Exception as e:
             logger.error(f"Failed to retrieve session data: {str(e)}")
             return create_error_response(500, "Failed to retrieve session data")
-        
+
+        original_s3_key = session_data.get('s3_key')
+        processed_s3_key = session_data.get('processed_s3_key')
+        has_processed = processed_s3_key is not None
+
+        # ── Download request ──────────────────────────────────────────────────
+        if download_target in ('original', 'processed'):
+            key = original_s3_key if download_target == 'original' else processed_s3_key
+            if not key:
+                return create_error_response(404, f"No {download_target} dataset found")
+
+            if download_format == 'json':
+                # Stream CSV, convert to JSON records, return inline
+                try:
+                    obj = s3_client.get_object(Bucket=DATA_BUCKET, Key=key)
+                    df = pd.read_csv(io.BytesIO(obj['Body'].read()))
+                    json_body = df.to_json(orient='records', default_handler=str)
+                    return {
+                        'statusCode': 200,
+                        'headers': {
+                            'Content-Type': 'application/json',
+                            'Content-Disposition': f'attachment; filename="{download_target}_data.json"',
+                            'Access-Control-Allow-Origin': '*',
+                        },
+                        'body': json_body,
+                    }
+                except Exception as e:
+                    logger.error(f"JSON conversion failed: {str(e)}")
+                    return create_error_response(500, "Failed to convert dataset to JSON")
+            else:
+                # Generate presigned URL for CSV download
+                try:
+                    presigned_url = s3_client.generate_presigned_url(
+                        'get_object',
+                        Params={
+                            'Bucket': DATA_BUCKET,
+                            'Key': key,
+                            'ResponseContentDisposition': f'attachment; filename="{download_target}_data.csv"',
+                            'ResponseContentType': 'text/csv',
+                        },
+                        ExpiresIn=3600,
+                    )
+                    return {
+                        'statusCode': 200,
+                        'headers': {
+                            'Content-Type': 'application/json',
+                            'Access-Control-Allow-Origin': '*',
+                        },
+                        'body': json.dumps({'download_url': presigned_url}),
+                    }
+                except Exception as e:
+                    logger.error(f"Failed to generate presigned URL: {str(e)}")
+                    return create_error_response(500, "Failed to generate download URL")
+
+        # ── Normal preview request ────────────────────────────────────────────
+        # Determine which file to load
+        if dataset_type == 'processed' and processed_s3_key:
+            s3_key = processed_s3_key
+        else:
+            s3_key = original_s3_key
+
+        if not s3_key:
+            return create_error_response(404, "Dataset not found for this session")
+
         # Load dataset from S3
         try:
-            response = s3_client.get_object(Bucket=DATA_BUCKET, Key=s3_key)
-            df = pd.read_csv(io.BytesIO(response['Body'].read()))
+            obj = s3_client.get_object(Bucket=DATA_BUCKET, Key=s3_key)
+            df = pd.read_csv(io.BytesIO(obj['Body'].read()))
         except Exception as e:
             logger.error(f"Failed to load dataset from S3: {str(e)}")
             return create_error_response(500, "Failed to load dataset")
-        
-        # Generate dataset preview
-        preview_data = generate_dataset_preview(df)
-        
-        # Calculate detailed statistics
+
+        # Generate paginated preview
+        preview_data = generate_dataset_preview(df, page=page, page_size=page_size)
+
+        # Statistics are computed on the full df (not paginated)
         detailed_stats = calculate_detailed_statistics(df)
-        
-        # Prepare response
+
+        # Generate presigned download URLs to include in every preview response
+        download_urls = {}
+        try:
+            download_urls['original_csv'] = s3_client.generate_presigned_url(
+                'get_object',
+                Params={
+                    'Bucket': DATA_BUCKET,
+                    'Key': original_s3_key,
+                    'ResponseContentDisposition': 'attachment; filename="original_data.csv"',
+                    'ResponseContentType': 'text/csv',
+                },
+                ExpiresIn=3600,
+            )
+            if processed_s3_key:
+                download_urls['processed_csv'] = s3_client.generate_presigned_url(
+                    'get_object',
+                    Params={
+                        'Bucket': DATA_BUCKET,
+                        'Key': processed_s3_key,
+                        'ResponseContentDisposition': 'attachment; filename="processed_data.csv"',
+                        'ResponseContentType': 'text/csv',
+                    },
+                    ExpiresIn=3600,
+                )
+        except Exception as e:
+            logger.warning(f"Could not generate presigned download URLs: {str(e)}")
+
         response_data = {
             'session_id': session_id,
             'dataset_name': session_data.get('dataset_name'),
@@ -77,66 +175,70 @@ def lambda_handler(event, context):
                 'total_rows': len(df),
                 'total_columns': len(df.columns),
                 'file_size': session_data.get('file_size'),
-                'upload_timestamp': session_data.get('timestamp')
-            }
+                'upload_timestamp': session_data.get('timestamp'),
+                'has_processed_data': has_processed,
+            },
+            'download_urls': download_urls,
         }
-        
+
         return {
             'statusCode': 200,
             'headers': {
                 'Content-Type': 'application/json',
                 'Access-Control-Allow-Origin': '*',
                 'Access-Control-Allow-Headers': 'Content-Type',
-                'Access-Control-Allow-Methods': 'GET, OPTIONS'
+                'Access-Control-Allow-Methods': 'GET, OPTIONS',
             },
-            'body': json.dumps(response_data, default=str)
+            'body': json.dumps(response_data, default=str),
         }
-        
+
     except Exception as e:
         logger.error(f"Unexpected error in preview handler: {str(e)}")
         return create_error_response(500, "Internal server error")
 
 
-def generate_dataset_preview(df: pd.DataFrame) -> Dict[str, Any]:
+def generate_dataset_preview(df: pd.DataFrame, page: int = 1, page_size: int = 15) -> Dict[str, Any]:
     """
-    Generate dataset preview showing first 10 rows in table format.
-    
+    Generate a paginated dataset preview.
+
     Args:
         df: Pandas DataFrame containing the dataset
-        
+        page: 1-based page number
+        page_size: Number of rows per page
+
     Returns:
-        Dictionary containing preview data
+        Dictionary containing preview data with pagination metadata
     """
     try:
-        # Get first 10 rows
-        preview_df = df.head(10)
-        
-        # Convert to dictionary format suitable for frontend table display
+        total_rows = len(df)
+        total_pages = max(1, -(-total_rows // page_size))  # ceiling division
+        page = max(1, min(page, total_pages))              # clamp to valid range
+        offset = (page - 1) * page_size
+
+        preview_df = df.iloc[offset: offset + page_size]
+
         preview_data = {
             'columns': list(df.columns),
             'rows': [],
             'total_rows_shown': len(preview_df),
-            'total_rows_available': len(df)
+            'total_rows_available': total_rows,
+            'current_page': page,
+            'total_pages': total_pages,
+            'page_size': page_size,
         }
-        
-        # Convert each row to a list of values
-        for index, row in preview_df.iterrows():
+
+        for _, row in preview_df.iterrows():
             row_data = []
             for col in df.columns:
                 value = row[col]
-                # Handle NaN values
                 if pd.isna(value):
                     row_data.append(None)
                 else:
-                    # Convert numpy types to Python types for JSON serialization
-                    if hasattr(value, 'item'):
-                        row_data.append(value.item())
-                    else:
-                        row_data.append(value)
+                    row_data.append(value.item() if hasattr(value, 'item') else value)
             preview_data['rows'].append(row_data)
-        
+
         return preview_data
-        
+
     except Exception as e:
         logger.error(f"Failed to generate dataset preview: {str(e)}")
         return {
@@ -144,7 +246,10 @@ def generate_dataset_preview(df: pd.DataFrame) -> Dict[str, Any]:
             'rows': [],
             'total_rows_shown': 0,
             'total_rows_available': 0,
-            'error': f"Preview generation failed: {str(e)}"
+            'current_page': 1,
+            'total_pages': 1,
+            'page_size': page_size,
+            'error': f"Preview generation failed: {str(e)}",
         }
 
 

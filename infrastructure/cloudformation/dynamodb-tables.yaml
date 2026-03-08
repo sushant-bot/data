@@ -42,6 +42,7 @@ Resources:
 
   # Operations Table - Log all preprocessing and training operations
   OperationsTable:
+    DependsOn: SessionsTable
     Type: AWS::DynamoDB::Table
     Properties:
       TableName: !Sub '${ProjectName}-operations-${Environment}'
@@ -73,6 +74,7 @@ Resources:
 
   # AI Decisions Table - Store AI recommendations and reasoning
   AIDecisionsTable:
+    DependsOn: OperationsTable
     Type: AWS::DynamoDB::Table
     Properties:
       TableName: !Sub '${ProjectName}-ai-decisions-${Environment}'
@@ -104,6 +106,7 @@ Resources:
 
   # Cache Table - Cache AI responses for performance optimization
   CacheTable:
+    DependsOn: AIDecisionsTable
     Type: AWS::DynamoDB::Table
     Properties:
       TableName: !Sub '${ProjectName}-cache-${Environment}'

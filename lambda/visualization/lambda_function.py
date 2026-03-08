@@ -10,13 +10,48 @@ import os
 from typing import Dict, List, Any, Optional
 import io
 import base64
+import sys
+import zipfile
+
+# ---------------------------------------------------------------------------
+# S3 bootstrap: download all ML packages to /tmp on first cold start.
+# Uses a self-contained zip (pandas+numpy+scipy+sklearn+matplotlib+seaborn)
+# so numpy ABI is consistent across all packages.
+# ---------------------------------------------------------------------------
+_ML_CACHE = '/tmp/ml_cache'
+if not os.path.exists(os.path.join(_ML_CACHE, 'matplotlib')):
+    _s3_boot = boto3.client('s3', region_name=os.environ.get('AWS_DEFAULT_REGION', 'us-east-1'))
+    _bucket = os.environ.get('BUCKET_NAME', 'ai-data-analyst-platform-data-dev-672627895253')
+    _data = _s3_boot.get_object(Bucket=_bucket, Key='lambda-layers/ml-all-packages.zip')['Body'].read()
+    os.makedirs(_ML_CACHE, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(_data)) as _zf:
+        for _m in _zf.namelist():
+            if _m.startswith('python/') and not _m.endswith('/'):
+                _t = os.path.join(_ML_CACHE, _m[7:])
+                os.makedirs(os.path.dirname(_t), exist_ok=True)
+                with open(_t, 'wb') as _f:
+                    _f.write(_zf.read(_m))
+    del _s3_boot, _bucket, _data, _zf, _m, _t, _f
+sys.path.insert(0, _ML_CACHE)
+del _ML_CACHE
+# ---------------------------------------------------------------------------
 
 # Visualization imports
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import confusion_matrix
+def confusion_matrix(y_true, y_pred, labels=None):
+    """Pure-numpy confusion matrix (replaces sklearn.metrics.confusion_matrix)."""
+    if labels is None:
+        labels = sorted(list(set(list(y_true) + list(y_pred))))
+    idx = {lbl: i for i, lbl in enumerate(labels)}
+    n = len(labels)
+    cm = np.zeros((n, n), dtype=int)
+    for t, p in zip(y_true, y_pred):
+        if t in idx and p in idx:
+            cm[idx[t]][idx[p]] += 1
+    return cm
 
 # Configure logging
 logger = logging.getLogger()
@@ -27,7 +62,7 @@ s3_client = boto3.client('s3')
 dynamodb = boto3.resource('dynamodb')
 
 # Environment variables
-BUCKET_NAME = os.environ.get('BUCKET_NAME', 'ai-data-analyst-platform-data-dev-077437903006')
+BUCKET_NAME = os.environ.get('BUCKET_NAME', 'ai-data-analyst-platform-data-dev-672627895253')
 OPERATIONS_TABLE = os.environ.get('OPERATIONS_TABLE', 'ai-data-analyst-platform-operations-dev')
 
 CORS_HEADERS = {
@@ -181,138 +216,83 @@ def generate_correlation_heatmap(session_id: str, dataset: pd.DataFrame,
         return None
 
 def generate_confusion_matrix_viz(session_id: str, parameters: Dict[str, Any]) -> Optional[str]:
-    """Generate confusion matrix visualization from ML results."""
+    """Return confusion matrix visualization from stored ML training results."""
     try:
-        # Load ML results from DynamoDB
-        ml_results = load_ml_results(session_id, 'supervised')
+        ml_results = load_ml_results(session_id)
         if not ml_results:
-            logger.warning("No supervised ML results found for confusion matrix")
+            logger.warning("No ML results found for confusion matrix")
             return None
-        
-        # Extract confusion matrix data from parameters or recreate
-        y_true = parameters.get('y_true')
-        y_pred = parameters.get('y_pred')
-        labels = parameters.get('labels')
-        
-        if not y_true or not y_pred:
-            logger.warning("Missing true/predicted values for confusion matrix")
-            return None
-        
-        # Create confusion matrix
-        cm = confusion_matrix(y_true, y_pred)
-        
-        plt.figure(figsize=(8, 6))
-        sns.heatmap(
-            cm,
-            annot=True,
-            fmt='d',
-            cmap='Blues',
-            xticklabels=labels if labels else range(len(cm)),
-            yticklabels=labels if labels else range(len(cm))
-        )
-        
-        plt.title('Confusion Matrix', fontsize=14, fontweight='bold')
-        plt.ylabel('True Label')
-        plt.xlabel('Predicted Label')
-        plt.tight_layout()
-        
-        # Save to S3
-        visualization_key = save_plot_to_s3(session_id, 'confusion_matrix')
-        plt.close()
-        
-        return visualization_key
-        
+
+        # Find the pre-generated confusion matrix S3 key stored by ml_training Lambda
+        for key in ml_results.get('visualizations', []):
+            if 'confusion_matrix' in str(key):
+                return str(key)
+
+        logger.warning("No confusion matrix visualization found in stored ML results")
+        return None
     except Exception as e:
-        logger.error(f"Error generating confusion matrix: {str(e)}")
+        logger.error(f"Error getting confusion matrix: {str(e)}")
         return None
 
 def generate_roc_curve_viz(session_id: str, parameters: Dict[str, Any]) -> Optional[str]:
-    """Generate ROC curve visualization."""
+    """Return ROC curve visualization from stored ML training results."""
     try:
-        from sklearn.metrics import roc_curve, auc
-        
-        # Extract ROC curve data from parameters
-        y_true = parameters.get('y_true')
-        y_scores = parameters.get('y_scores')
-        
-        if not y_true or not y_scores:
-            logger.warning("Missing data for ROC curve generation")
+        ml_results = load_ml_results(session_id)
+        if not ml_results:
+            logger.warning("No ML results found for ROC curve")
             return None
-        
-        # Calculate ROC curve
-        fpr, tpr, _ = roc_curve(y_true, y_scores)
-        roc_auc = auc(fpr, tpr)
-        
-        plt.figure(figsize=(8, 6))
-        plt.plot(fpr, tpr, color='darkorange', lw=2, 
-                label=f'ROC curve (AUC = {roc_auc:.2f})')
-        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', 
-                label='Random Classifier')
-        
-        plt.xlim([0.0, 1.0])
-        plt.ylim([0.0, 1.05])
-        plt.xlabel('False Positive Rate')
-        plt.ylabel('True Positive Rate')
-        plt.title('Receiver Operating Characteristic (ROC) Curve', 
-                 fontsize=14, fontweight='bold')
-        plt.legend(loc="lower right")
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        
-        # Save to S3
-        visualization_key = save_plot_to_s3(session_id, 'roc_curve')
-        plt.close()
-        
-        return visualization_key
-        
+
+        for key in ml_results.get('visualizations', []):
+            if 'roc_curve' in str(key):
+                return str(key)
+
+        logger.warning("No ROC curve visualization found in stored ML results")
+        return None
     except Exception as e:
-        logger.error(f"Error generating ROC curve: {str(e)}")
+        logger.error(f"Error getting ROC curve: {str(e)}")
         return None
 
 def generate_cluster_plot_viz(session_id: str, dataset: pd.DataFrame, 
                             parameters: Dict[str, Any]) -> Optional[str]:
-    """Generate cluster plot visualization."""
+    """Return cluster plot from stored ML training results, or re-generate using KMeans."""
     try:
-        # Extract clustering parameters
-        labels = parameters.get('labels')
-        feature_columns = parameters.get('feature_columns', [])
-        cluster_centers = parameters.get('cluster_centers')
-        
-        if labels is None:
-            logger.warning("Missing cluster labels for cluster plot")
+        # First try to return stored cluster_plot from ml_training results
+        ml_results = load_ml_results(session_id)
+        if ml_results:
+            for key in ml_results.get('visualizations', []):
+                if 'cluster_plot' in str(key):
+                    return str(key)
+
+        # Fallback: re-generate with KMeans on the dataset's numeric columns
+        numeric_cols = dataset.select_dtypes(include=[np.number]).columns.tolist()
+        if len(numeric_cols) < 2:
+            logger.warning("Not enough numeric features for cluster plot")
             return None
-        
-        # Use first two features for 2D visualization
-        if len(feature_columns) < 2:
-            numeric_columns = dataset.select_dtypes(include=[np.number]).columns.tolist()
-            if len(numeric_columns) < 2:
-                logger.warning("Not enough numeric features for cluster plot")
-                return None
-            feature_columns = numeric_columns[:2]
-        
-        x_col, y_col = feature_columns[0], feature_columns[1]
-        
-        plt.figure(figsize=(10, 8))
-        
-        # Create scatter plot
-        scatter = plt.scatter(
-            dataset[x_col], dataset[y_col], 
-            c=labels, cmap='viridis', alpha=0.7, s=50
-        )
-        
-        # Plot cluster centers if available
-        if cluster_centers is not None:
-            plt.scatter(
-                cluster_centers[:, 0], cluster_centers[:, 1],
-                c='red', marker='x', s=200, linewidths=3, 
-                label='Centroids'
-            )
-            plt.legend()
-        
-        plt.xlabel(x_col, fontsize=12)
-        plt.ylabel(y_col, fontsize=12)
-        plt.title('Cluster Analysis Results', fontsize=14, fontweight='bold')
+
+        x_col, y_col = numeric_cols[0], numeric_cols[1]
+        from sklearn.cluster import KMeans as _KMeans
+        km = _KMeans(n_clusters=3, random_state=42, n_init='auto')
+        labels = km.fit_predict(dataset[numeric_cols].fillna(0))
+
+        plt.figure(figsize=(9, 7))
+        scatter = plt.scatter(dataset[x_col], dataset[y_col], c=labels, cmap='viridis', alpha=0.7, s=40)
+        plt.scatter(km.cluster_centers_[:, 0], km.cluster_centers_[:, 1],
+                    c='red', marker='x', s=200, linewidths=3, label='Centroids')
+        plt.xlabel(x_col, fontsize=11)
+        plt.ylabel(y_col, fontsize=11)
+        plt.title('Cluster Analysis (KMeans, k=3)', fontsize=13, fontweight='bold')
         plt.colorbar(scatter, label='Cluster')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        key = save_plot_to_s3(session_id, 'cluster_plot')
+        plt.close()
+        return key
+
+    except Exception as e:
+        logger.error(f"Error generating cluster plot: {str(e)}")
+        return None
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
         
@@ -327,44 +307,21 @@ def generate_cluster_plot_viz(session_id: str, dataset: pd.DataFrame,
         return None
 
 def generate_feature_importance_viz(session_id: str, parameters: Dict[str, Any]) -> Optional[str]:
-    """Generate feature importance visualization."""
+    """Return feature importance visualization from stored ML training results."""
     try:
-        # Extract feature importance data
-        importances = parameters.get('importances')
-        feature_names = parameters.get('feature_names')
-        
-        if not importances or not feature_names:
-            logger.warning("Missing feature importance data")
+        ml_results = load_ml_results(session_id)
+        if not ml_results:
+            logger.warning("No ML results found for feature importance")
             return None
-        
-        # Sort features by importance
-        indices = np.argsort(importances)[::-1]
-        sorted_importances = [importances[i] for i in indices]
-        sorted_features = [feature_names[i] for i in indices]
-        
-        plt.figure(figsize=(12, 8))
-        bars = plt.bar(range(len(sorted_importances)), sorted_importances)
-        
-        # Color bars by importance
-        colors = plt.cm.viridis(np.linspace(0, 1, len(bars)))
-        for bar, color in zip(bars, colors):
-            bar.set_color(color)
-        
-        plt.title('Feature Importance', fontsize=14, fontweight='bold')
-        plt.xlabel('Features')
-        plt.ylabel('Importance Score')
-        plt.xticks(range(len(sorted_features)), sorted_features, rotation=45, ha='right')
-        plt.grid(True, alpha=0.3, axis='y')
-        plt.tight_layout()
-        
-        # Save to S3
-        visualization_key = save_plot_to_s3(session_id, 'feature_importance')
-        plt.close()
-        
-        return visualization_key
-        
+
+        for key in ml_results.get('visualizations', []):
+            if 'feature_importance' in str(key):
+                return str(key)
+
+        logger.warning("No feature importance visualization found in stored ML results")
+        return None
     except Exception as e:
-        logger.error(f"Error generating feature importance plot: {str(e)}")
+        logger.error(f"Error getting feature importance: {str(e)}")
         return None
 
 
@@ -393,18 +350,19 @@ def save_plot_to_s3(session_id: str, chart_type: str) -> Optional[str]:
         return None
 
 
-def load_ml_results(session_id: str, result_type: str) -> Optional[Dict[str, Any]]:
-    """Load ML training results from DynamoDB Operations table."""
+def load_ml_results(session_id: str) -> Optional[Dict[str, Any]]:
+    """Load the most recent ML training results from the Operations DynamoDB table."""
     try:
         table = dynamodb.Table(OPERATIONS_TABLE)
         response = table.query(
             KeyConditionExpression=boto3.dynamodb.conditions.Key('session_id').eq(session_id),
             ScanIndexForward=False,
-            Limit=10
+            Limit=20
         )
 
         for item in response.get('Items', []):
-            if item.get('operation_type') == 'ml_training' and item.get('ml_type') == result_type:
+            # ml_training Lambda stores results with operation_type = 'ml_results'
+            if item.get('operation_type') == 'ml_results':
                 return item
 
         return None

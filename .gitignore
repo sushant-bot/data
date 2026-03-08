@@ -21,11 +21,21 @@ lambda/**/function.zip
 lambda/**/package/
 lambda-arns.json
 layer-build/
+build-sklearn-layer/
+build-sklearn-layer-v2/
+attach_layer*.py
+attach_layer*.txt
+attach_*.py
+attach_*.txt
+attach_out*.txt
+attach_sklearn*.py
+attach_sklearn*.txt
 
 # Environment & secrets
 .env
 .env.local
 .env.production
+frontend/.env
 frontend/.env.local
 frontend/.env.production
 
@@ -53,6 +63,28 @@ infrastructure/config/
 # Logs
 *.log
 npm-debug.log*
+
+# Scratch scripts & build output files in project root
+build_*.py
+deploy_*.py
+redeploy_*.py
+rebuild_*.py
+check_logs.py
+fix_permissions.py
+lambda_test_imports.py
+attach_*.py
+*.txt
+frontend/build_out.txt
+frontend/build_result.txt
+# Root-level scratch/test/output files
+test_*.py
+run_deploy.bat
+response.json
+test_payload.json
+upload_test.json
+tmp-policy.json
+sklearn_layer_arn.txt
+sklearn_out.txt
 
 # Testing
 .coverage

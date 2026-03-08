@@ -12,31 +12,40 @@ import base64
 
 # Machine Learning imports
 from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import SVC
 from sklearn.cluster import KMeans, DBSCAN
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
-    confusion_matrix, roc_curve, auc, silhouette_score
+    confusion_matrix, roc_curve, auc, silhouette_score,
+    mean_absolute_error, mean_squared_error, r2_score
 )
-from sklearn.preprocessing import LabelEncoder
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
-import matplotlib.pyplot as plt
-import seaborn as sns
+from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler
+
+# Visualization imports — optional (not available in every layer configuration)
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # Use non-interactive backend
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
 
 # Configure logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+if not HAS_MATPLOTLIB:
+    logger.warning('matplotlib/seaborn not available — chart generation will be skipped')
 
 # Initialize AWS clients
 s3_client = boto3.client('s3')
 dynamodb = boto3.resource('dynamodb')
 
 # Environment variables
-BUCKET_NAME = os.environ.get('BUCKET_NAME', 'ai-data-analyst-platform-data-dev-077437903006')
+BUCKET_NAME = os.environ.get('BUCKET_NAME', 'ai-data-analyst-platform-data-dev-672627895253')
 SESSIONS_TABLE = os.environ.get('SESSIONS_TABLE', 'ai-data-analyst-platform-sessions-dev')
 OPERATIONS_TABLE = os.environ.get('OPERATIONS_TABLE', 'ai-data-analyst-platform-operations-dev')
 
@@ -55,12 +64,27 @@ def lambda_handler(event, context):
     try:
         # Parse request
         body = json.loads(event['body']) if isinstance(event.get('body'), str) else event.get('body', {})
+
+        # ── Warmup ping ────────────────────────────────────────────────────────
+        # ML packages are already loaded at module level (cold-start bootstrap).
+        # Returning immediately keeps the container alive for the real training
+        # call that follows a moment later from the frontend.
+        if body.get('warmup'):
+            return {
+                'statusCode': 200,
+                'headers': CORS_HEADERS,
+                'body': json.dumps({'status': 'warm'})
+            }
+        # ──────────────────────────────────────────────────────────────────────
+
         session_id = body.get('session_id')
         model_type = body.get('model_type')  # 'supervised' or 'unsupervised'
         algorithm = body.get('algorithm')
         target_column = body.get('target_column')  # For supervised learning
         feature_columns = body.get('feature_columns', [])
         parameters = body.get('parameters', {})
+        # 'processed' (default) | 'original' — user can explicitly choose
+        preferred_dataset = body.get('dataset_type', 'processed')
         
         if not session_id or not model_type or not algorithm:
             return {
@@ -73,14 +97,15 @@ def lambda_handler(event, context):
         
         logger.info(f"Starting ML training for session {session_id}, type: {model_type}, algorithm: {algorithm}")
         
-        # Load processed dataset
-        dataset = load_processed_dataset(session_id)
+        # Load dataset according to user preference
+        dataset, dataset_type = load_processed_dataset(session_id, preferred_dataset)
         if dataset is None:
             return {
                 'statusCode': 404,
                 'headers': CORS_HEADERS,
-                'body': json.dumps({'error': 'Processed dataset not found'})
+                'body': json.dumps({'error': 'Dataset not found. Please upload a file first.'})
             }
+        logger.info(f"Using {dataset_type} dataset for training")
         
         # Log operation start
         operation_id = str(uuid.uuid4())
@@ -122,6 +147,7 @@ def lambda_handler(event, context):
                 'session_id': session_id,
                 'model_type': model_type,
                 'algorithm': algorithm,
+                'dataset_type': dataset_type,
                 'results': result
             })
         }
@@ -134,16 +160,28 @@ def lambda_handler(event, context):
             'body': json.dumps({'error': f'Internal server error: {str(e)}'})
         }
 
-def load_processed_dataset(session_id: str) -> Optional[pd.DataFrame]:
-    """Load processed dataset from S3."""
-    try:
-        key = f"datasets/{session_id}/processed.csv"
-        response = s3_client.get_object(Bucket=BUCKET_NAME, Key=key)
-        csv_content = response['Body'].read().decode('utf-8')
-        return pd.read_csv(io.StringIO(csv_content))
-    except Exception as e:
-        logger.error(f"Error loading processed dataset: {str(e)}")
-        return None
+def load_processed_dataset(session_id: str, preferred: str = 'processed') -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    """Load dataset for training.
+    preferred='processed' : try processed first, fall back to original.
+    preferred='original'  : load original only (no fallback).
+    Returns (dataframe, dataset_type_used).
+    """
+    if preferred == 'original':
+        types_to_try = ['original']
+    else:
+        types_to_try = ['processed', 'original']  # fall back to original if no processed exists
+
+    for dataset_type in types_to_try:
+        try:
+            key = f"datasets/{session_id}/{dataset_type}.csv"
+            response = s3_client.get_object(Bucket=BUCKET_NAME, Key=key)
+            csv_content = response['Body'].read().decode('utf-8')
+            df = pd.read_csv(io.StringIO(csv_content))
+            logger.info(f"Loaded {dataset_type} dataset for training: shape={df.shape}")
+            return df, dataset_type
+        except Exception as e:
+            logger.warning(f"Could not load {dataset_type} dataset: {str(e)}")
+    return None, None
 
 def train_supervised_model(dataset: pd.DataFrame, algorithm: str, target_column: str, 
                          feature_columns: List[str], parameters: Dict) -> Dict[str, Any]:
@@ -160,19 +198,63 @@ def train_supervised_model(dataset: pd.DataFrame, algorithm: str, target_column:
         # Prepare data
         X = dataset[feature_columns]
         y = dataset[target_column]
+
+        # Drop non-numeric feature columns (encode them if needed, or just drop)
+        non_numeric = X.select_dtypes(exclude=[np.number]).columns.tolist()
+        if non_numeric:
+            logger.warning(f"Dropping non-numeric feature columns: {non_numeric}")
+            X = X.select_dtypes(include=[np.number])
+            feature_columns = X.columns.tolist()
+
+        if len(feature_columns) == 0:
+            raise ValueError(
+                "No numeric feature columns remain. "
+                "Please apply Label Encoding or One-Hot Encoding to categorical columns "
+                "in the Preprocessing step before training."
+            )
+
+        # Drop rows with NaN in features or target
+        valid_mask = X.notna().all(axis=1) & pd.notna(y)
+        X = X[valid_mask]
+        y = y[valid_mask]
+
+        # Determine if this is a regression algorithm
+        is_regression = algorithm == 'linear_regression'
         
-        # Handle categorical target variable
+        # Handle categorical target for classification
         label_encoder = None
-        if y.dtype == 'object':
+        if not is_regression and y.dtype == 'object':
             label_encoder = LabelEncoder()
             y = label_encoder.fit_transform(y)
         
         # Split data
         test_size = parameters.get('test_size', 0.2)
         random_state = parameters.get('random_state', 42)
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=random_state, stratify=y
-        )
+        if is_regression:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=test_size, random_state=random_state
+            )
+        else:
+            try:
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, y, test_size=test_size, random_state=random_state, stratify=y
+                )
+            except ValueError:
+                # Not enough samples per class for stratified split
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, y, test_size=test_size, random_state=random_state
+                )
+
+        # Apply optional feature scaler
+        scaler_name = parameters.get('scaler', 'none')
+        if scaler_name == 'standard':
+            scaler = StandardScaler()
+            X_train = scaler.fit_transform(X_train)
+            X_test = scaler.transform(X_test)
+        elif scaler_name == 'minmax':
+            scaler = MinMaxScaler()
+            X_train = scaler.fit_transform(X_train)
+            X_test = scaler.transform(X_test)
         
         # Train model
         model = create_supervised_model(algorithm, parameters)
@@ -181,11 +263,14 @@ def train_supervised_model(dataset: pd.DataFrame, algorithm: str, target_column:
         # Make predictions
         y_pred = model.predict(X_test)
         y_pred_proba = None
-        if hasattr(model, 'predict_proba'):
+        if not is_regression and hasattr(model, 'predict_proba'):
             y_pred_proba = model.predict_proba(X_test)
         
         # Calculate metrics
-        metrics = calculate_supervised_metrics(y_test, y_pred, y_pred_proba)
+        if is_regression:
+            metrics = calculate_regression_metrics(y_test, y_pred)
+        else:
+            metrics = calculate_supervised_metrics(y_test, y_pred, y_pred_proba)
         
         # Generate visualizations
         visualizations = generate_supervised_visualizations(
@@ -257,6 +342,8 @@ def create_supervised_model(algorithm: str, parameters: Dict):
             random_state=parameters.get('random_state', 42),
             max_iter=parameters.get('max_iter', 1000)
         )
+    elif algorithm == 'linear_regression':
+        return LinearRegression()
     elif algorithm == 'random_forest':
         return RandomForestClassifier(
             n_estimators=parameters.get('n_estimators', 100),
@@ -292,7 +379,7 @@ def create_unsupervised_model(algorithm: str, parameters: Dict):
         raise ValueError(f"Unsupported unsupervised algorithm: {algorithm}")
 
 def calculate_supervised_metrics(y_true, y_pred, y_pred_proba=None) -> Dict[str, float]:
-    """Calculate metrics for supervised learning."""
+    """Calculate metrics for supervised learning (classification)."""
     metrics = {
         'accuracy': float(accuracy_score(y_true, y_pred)),
         'precision': float(precision_score(y_true, y_pred, average='weighted', zero_division=0)),
@@ -306,6 +393,18 @@ def calculate_supervised_metrics(y_true, y_pred, y_pred_proba=None) -> Dict[str,
         metrics['auc'] = float(auc(fpr, tpr))
     
     return metrics
+
+
+def calculate_regression_metrics(y_true, y_pred) -> Dict[str, float]:
+    """Calculate metrics for regression (LinearRegression, etc.)."""
+    mae = float(mean_absolute_error(y_true, y_pred))
+    mse = float(mean_squared_error(y_true, y_pred))
+    return {
+        'mae': mae,
+        'mse': mse,
+        'rmse': float(np.sqrt(mse)),
+        'r2_score': float(r2_score(y_true, y_pred)),
+    }
 
 def calculate_unsupervised_metrics(X, labels) -> Dict[str, float]:
     """Calculate metrics for unsupervised learning."""
@@ -333,31 +432,39 @@ def calculate_unsupervised_metrics(X, labels) -> Dict[str, float]:
         metrics['n_noise_points'] = int(np.sum(labels == -1))
     
     return metrics
-def generate_supervised_visualizations(y_true, y_pred, y_pred_proba, feature_columns, 
+def generate_supervised_visualizations(y_true, y_pred, y_pred_proba, feature_columns,
                                      model, algorithm) -> List[str]:
     """Generate visualizations for supervised learning results."""
+    if not HAS_MATPLOTLIB:
+        return []
     visualizations = []
-    
+    is_regression = algorithm == 'linear_regression'
+
     try:
-        # Confusion Matrix
-        cm = confusion_matrix(y_true, y_pred)
-        plt.figure(figsize=(8, 6))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-        plt.title(f'Confusion Matrix - {algorithm.replace("_", " ").title()}')
-        plt.ylabel('True Label')
-        plt.xlabel('Predicted Label')
-        
-        confusion_matrix_key = save_plot_to_s3('confusion_matrix', algorithm)
-        visualizations.append(confusion_matrix_key)
-        plt.close()
-        
-        # ROC Curve (for binary classification)
-        if len(np.unique(y_true)) == 2 and y_pred_proba is not None:
+        # Confusion Matrix — skip for regression; guard against too many unique classes
+        if not is_regression:
+            unique_classes = np.unique(y_true)
+            if len(unique_classes) <= 50:  # Safety: large class counts → OOM
+                cm = confusion_matrix(y_true, y_pred)
+                plt.figure(figsize=(8, 6))
+                # Only annotate cells when class count is small
+                annot = len(unique_classes) <= 20
+                sns.heatmap(cm, annot=annot, fmt='d', cmap='Blues')
+                plt.title(f'Confusion Matrix - {algorithm.replace("_", " ").title()}')
+                plt.ylabel('True Label')
+                plt.xlabel('Predicted Label')
+
+                confusion_matrix_key = save_plot_to_s3('confusion_matrix', algorithm)
+                visualizations.append(confusion_matrix_key)
+                plt.close()
+
+        # ROC Curve (binary classification only)
+        if not is_regression and len(np.unique(y_true)) == 2 and y_pred_proba is not None:
             fpr, tpr, _ = roc_curve(y_true, y_pred_proba[:, 1])
             roc_auc = auc(fpr, tpr)
-            
+
             plt.figure(figsize=(8, 6))
-            plt.plot(fpr, tpr, color='darkorange', lw=2, 
+            plt.plot(fpr, tpr, color='darkorange', lw=2,
                     label=f'ROC curve (AUC = {roc_auc:.2f})')
             plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
             plt.xlim([0.0, 1.0])
@@ -366,35 +473,37 @@ def generate_supervised_visualizations(y_true, y_pred, y_pred_proba, feature_col
             plt.ylabel('True Positive Rate')
             plt.title(f'ROC Curve - {algorithm.replace("_", " ").title()}')
             plt.legend(loc="lower right")
-            
+
             roc_curve_key = save_plot_to_s3('roc_curve', algorithm)
             visualizations.append(roc_curve_key)
             plt.close()
-        
-        # Feature Importance (for tree-based models)
+
+        # Feature Importance (tree-based models)
         if hasattr(model, 'feature_importances_'):
             importances = model.feature_importances_
             indices = np.argsort(importances)[::-1]
-            
+
             plt.figure(figsize=(10, 6))
             plt.title(f'Feature Importance - {algorithm.replace("_", " ").title()}')
             plt.bar(range(len(importances)), importances[indices])
-            plt.xticks(range(len(importances)), 
+            plt.xticks(range(len(importances)),
                       [feature_columns[i] for i in indices], rotation=45)
             plt.tight_layout()
-            
+
             feature_importance_key = save_plot_to_s3('feature_importance', algorithm)
             visualizations.append(feature_importance_key)
             plt.close()
-            
+
     except Exception as e:
         logger.error(f"Error generating supervised visualizations: {str(e)}")
-    
+
     return visualizations
 
 def generate_unsupervised_visualizations(X, labels, feature_columns, algorithm, 
                                        cluster_centers=None) -> List[str]:
     """Generate visualizations for unsupervised learning results."""
+    if not HAS_MATPLOTLIB:
+        return []
     visualizations = []
     
     try:

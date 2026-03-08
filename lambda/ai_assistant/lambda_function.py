@@ -24,7 +24,7 @@ dynamodb = boto3.resource('dynamodb', region_name=aws_region)
 bedrock_client = boto3.client('bedrock-runtime', region_name=aws_region)
 
 # Environment variables
-BUCKET_NAME = os.environ.get('BUCKET_NAME', 'ai-data-analyst-platform-data-dev-077437903006')
+BUCKET_NAME = os.environ.get('BUCKET_NAME', 'ai-data-analyst-platform-data-dev-672627895253')
 SESSIONS_TABLE = os.environ.get('SESSIONS_TABLE', 'ai-data-analyst-platform-sessions-dev')
 AI_DECISIONS_TABLE = os.environ.get('AI_DECISIONS_TABLE', 'ai-data-analyst-platform-ai-decisions-dev')
 CACHE_TABLE = os.environ.get('CACHE_TABLE', 'ai-data-analyst-platform-cache-dev')
@@ -69,14 +69,15 @@ def lambda_handler(event, context):
         # Analyze dataset characteristics
         characteristics = analyze_dataset_characteristics(dataset)
 
-        # Load quality assessment if available
-        quality_report = load_quality_report(session_id)
+        # Compute quality report directly from the loaded dataset
+        quality_report = compute_quality_report(dataset, session_data)
 
         # Build prompt for Bedrock
         prompt = build_recommendation_prompt(characteristics, quality_report)
 
-        # Check cache first
-        prompt_hash = generate_prompt_hash(prompt)
+        # Check cache first — key is scoped per session so different sessions
+        # never share cached recommendations.
+        prompt_hash = generate_prompt_hash(prompt, session_id)
         cached_response = check_cache(prompt_hash)
 
         if cached_response:
@@ -89,19 +90,18 @@ def lambda_handler(event, context):
 
             if ai_response:
                 recommendations = parse_ai_response(ai_response, characteristics)
+                # Only cache AI-generated responses, not rule-based fallback
+                store_cache(prompt_hash, recommendations)
             else:
                 # Fallback to rule-based recommendations
                 logger.warning("Bedrock failed, using rule-based fallback")
                 recommendations = generate_rule_based_recommendations(characteristics, quality_report)
+                # Do NOT cache rule-based responses — they should always be freshly computed
 
-            # Cache the response
-            store_cache(prompt_hash, recommendations)
-
-        # Add quality-based recommendations if available
-        if quality_report:
-            quality_recommendations = generate_quality_based_recommendations(quality_report)
-            recommendations['quality_recommendations'] = quality_recommendations
-            recommendations['quality_score'] = quality_report.get('overall_quality_score', 0)
+        # Add quality-based recommendations
+        quality_recommendations = generate_quality_based_recommendations(quality_report)
+        recommendations['quality_recommendations'] = quality_recommendations
+        recommendations['quality_score'] = quality_report.get('overall_quality_score', 0)
 
         # Store AI decision in DynamoDB
         store_ai_decision(session_id, recommendations, characteristics)
@@ -150,8 +150,68 @@ def load_dataset(session_id: str) -> Optional[pd.DataFrame]:
     return None
 
 
+def compute_quality_report(dataset: pd.DataFrame, session_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Compute a quality report from the loaded dataset.
+    Uses the quality_score stored in the session table (written by the preprocessing lambda
+    after each preprocessing run) and computes missing-value / duplicate metrics in-process.
+    """
+    try:
+        num_rows, num_cols = dataset.shape
+        total_cells = max(num_rows * num_cols, 1)
+        total_missing = int(dataset.isnull().sum().sum())
+        missing_pct = round((total_missing / total_cells) * 100, 2)
+        cols_with_missing = int((dataset.isnull().sum() > 0).sum())
+        duplicate_count = int(dataset.duplicated().sum())
+        dup_pct = round((duplicate_count / max(num_rows, 1)) * 100, 2)
+
+        # Use quality_score stored by the preprocessing lambda when available
+        stored_score = session_data.get('quality_score')
+        if stored_score is not None:
+            try:
+                quality_score = float(stored_score)
+            except (TypeError, ValueError):
+                quality_score = None
+        else:
+            quality_score = None
+
+        if not quality_score:  # 0 or None → compute a simple estimate
+            missing_penalty = min(missing_pct * 2, 40)
+            dup_penalty = min(dup_pct * 0.5, 20)
+            quality_score = round(max(0.0, 100.0 - missing_penalty - dup_penalty), 1)
+
+        # Detect class imbalance in likely categorical columns
+        max_imbalance = 1.0
+        for col in dataset.select_dtypes(include=['object', 'category']).columns:
+            vc = dataset[col].value_counts()
+            if len(vc) >= 2:
+                ratio = vc.iloc[0] / max(vc.iloc[-1], 1)
+                max_imbalance = max(max_imbalance, float(ratio))
+
+        return {
+            'overall_quality_score': quality_score,
+            'missing_value_analysis': {
+                'overall_missing_percentage': missing_pct,
+                'total_missing_values': total_missing,
+                'columns_with_missing': cols_with_missing,
+            },
+            'duplicate_analysis': {
+                'duplicate_count': duplicate_count,
+                'duplicate_percentage': dup_pct,
+                'has_duplicates': duplicate_count > 0,
+            },
+            'data_imbalance_analysis': {
+                'max_imbalance_ratio': max_imbalance,
+                'overall_imbalance_ratio': max_imbalance,
+            },
+        }
+    except Exception as e:
+        logger.error(f"Error computing quality report: {str(e)}")
+        return {'overall_quality_score': 0}
+
+
 def load_quality_report(session_id: str) -> Optional[Dict[str, Any]]:
-    """Load quality assessment report from DynamoDB operations table."""
+    """Legacy: Load quality assessment report from DynamoDB operations table."""
     try:
         table = dynamodb.Table(OPERATIONS_TABLE)
         response = table.query(
@@ -281,9 +341,10 @@ Respond in JSON format with the following structure:
     return prompt
 
 
-def generate_prompt_hash(prompt: str) -> str:
-    """Generate SHA-256 hash of the prompt for caching."""
-    return hashlib.sha256(prompt.encode('utf-8')).hexdigest()
+def generate_prompt_hash(prompt: str, session_id: str = '') -> str:
+    """Generate SHA-256 hash of the prompt scoped to a session for caching."""
+    combined = f"{session_id}:{prompt}"
+    return hashlib.sha256(combined.encode('utf-8')).hexdigest()
 
 
 def check_cache(prompt_hash: str) -> Optional[Dict[str, Any]]:

@@ -6,9 +6,8 @@ import logging
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 import io
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, LabelEncoder
-from sklearn.impute import SimpleImputer
 import uuid
+from decimal import Decimal, InvalidOperation
 
 # Import quality assessment module
 from quality_assessment import assess_dataset_quality
@@ -25,7 +24,7 @@ s3_client = boto3.client('s3', region_name=aws_region)
 dynamodb = boto3.resource('dynamodb', region_name=aws_region)
 
 # Environment variables
-DATA_BUCKET = os.environ.get('DATA_BUCKET', 'ai-data-analyst-platform-data-dev-077437903006')
+DATA_BUCKET = os.environ.get('DATA_BUCKET', 'ai-data-analyst-platform-data-dev-672627895253')
 SESSIONS_TABLE = os.environ.get('SESSIONS_TABLE', 'ai-data-analyst-platform-sessions-dev')
 OPERATIONS_TABLE = os.environ.get('OPERATIONS_TABLE', 'ai-data-analyst-platform-operations-dev')
 
@@ -176,63 +175,82 @@ def handle_preprocessing_operations(event, context):
         # Process operations sequentially
         processed_df = df.copy()
         operation_results = []
-        
+
         for operation in operations:
             try:
+                # Capture pre-operation null stats for richer reporting
+                nulls_before = int(processed_df.isnull().sum().sum())
+                null_per_col_before = {col: int(processed_df[col].isnull().sum()) for col in processed_df.columns}
+
                 start_time = datetime.utcnow()
-                
+
+                # Normalise frontend format → internal format
+                internal_op = normalize_operation(operation)
+
                 # Execute the preprocessing operation
                 processed_df, operation_result = execute_preprocessing_operation(
-                    processed_df, operation
+                    processed_df, internal_op
                 )
-                
+
                 end_time = datetime.utcnow()
                 duration_ms = int((end_time - start_time).total_seconds() * 1000)
-                
-                # Log operation details
+
+                # Post-operation null stats
+                nulls_after = int(processed_df.isnull().sum().sum())
+                null_per_col_after = {col: int(processed_df[col].isnull().sum()) for col in processed_df.columns}
+
+                # Build enriched log entry
                 operation_log = {
                     'session_id': session_id,
                     'timestamp': start_time.isoformat(),
                     'operation_type': 'preprocessing',
-                    'action': operation.get('type'),
-                    'parameters': operation.get('parameters', {}),
+                    'action': internal_op.get('type'),
+                    'original_operation': operation.get('operation', internal_op.get('type')),
+                    'parameters': internal_op.get('parameters', {}),
                     'status': 'completed',
                     'duration_ms': duration_ms,
                     'rows_before': len(df),
                     'rows_after': len(processed_df),
                     'columns_before': len(df.columns),
-                    'columns_after': len(processed_df.columns)
+                    'columns_after': len(processed_df.columns),
+                    'nulls_before': nulls_before,
+                    'nulls_after': nulls_after,
+                    'nulls_removed': nulls_before - nulls_after,
+                    'null_per_column_before': null_per_col_before,
+                    'null_per_column_after': null_per_col_after,
                 }
                 operation_log.update(operation_result)
-                
+
                 operation_results.append(operation_log)
-                
-                # Store operation log in DynamoDB
-                operations_table = dynamodb.Table(OPERATIONS_TABLE)
-                operations_table.put_item(Item=operation_log)
-                
                 logger.info(f"Completed operation: {operation.get('type')}")
                 
             except Exception as e:
-                logger.error(f"Failed to execute operation {operation.get('type')}: {str(e)}")
-                
-                # Log failed operation
+                logger.error(f"Failed to execute operation {operation.get('operation', operation.get('type'))}: {str(e)}")
+
                 operation_log = {
                     'session_id': session_id,
                     'timestamp': datetime.utcnow().isoformat(),
                     'operation_type': 'preprocessing',
-                    'action': operation.get('type'),
+                    'action': operation.get('type') or operation.get('operation'),
+                    'original_operation': operation.get('operation', ''),
                     'parameters': operation.get('parameters', {}),
                     'status': 'failed',
                     'error': str(e),
                     'rows_before': len(df),
-                    'rows_after': len(processed_df)
+                    'rows_after': len(processed_df),
+                    'columns_before': len(df.columns),
+                    'columns_after': len(processed_df.columns),
                 }
-                
+
                 operation_results.append(operation_log)
-                
-                # Continue with other operations even if one fails
-                continue
+
+            # Write to DynamoDB separately so serialization errors don't affect op status
+            try:
+                operations_table = dynamodb.Table(OPERATIONS_TABLE)
+                operations_table.put_item(Item=convert_floats_to_decimal(operation_log))
+            except Exception as db_err:
+                logger.error(f"DynamoDB write error (non-fatal): {db_err}")
+                # Continue — the processed data is still saved to S3
         
         # Store processed dataset in S3
         try:
@@ -263,7 +281,7 @@ def handle_preprocessing_operations(event, context):
                 UpdateExpression='SET processed_s3_key = :key, quality_score = :score, last_updated = :timestamp',
                 ExpressionAttributeValues={
                     ':key': processed_s3_key,
-                    ':score': quality_metrics['overall_quality_score'],
+                    ':score': Decimal(str(round(float(quality_metrics['overall_quality_score']), 2))),
                     ':timestamp': datetime.utcnow().isoformat()
                 }
             )
@@ -301,6 +319,72 @@ def handle_preprocessing_operations(event, context):
     except Exception as e:
         logger.error(f"Unexpected error in processing handler: {str(e)}")
         return create_error_response(500, "Internal server error")
+
+
+def normalize_operation(operation: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert the frontend operation format to the internal Lambda format.
+
+    Frontend sends:
+        {operation: 'handle_missing', method: 'fill', columns: [...]}
+    Internal format:
+        {type: 'null_filling', parameters: {strategy: 'mean', columns: [...]}}
+    """
+    # If already in internal format, pass through
+    if 'type' in operation:
+        return operation
+
+    op = operation.get('operation', '')
+    method = operation.get('method', '')
+    columns = operation.get('columns') or None  # empty list → None (means all columns)
+
+    if op == 'handle_missing':
+        if method == 'drop':
+            return {
+                'type': 'null_removal',
+                'parameters': {'method': 'drop_rows', 'columns': columns},
+            }
+        else:  # fill (default: fill with mean for numeric, mode for categorical)
+            return {
+                'type': 'null_filling',
+                'parameters': {'strategy': 'mean', 'columns': columns},
+            }
+
+    elif op == 'detect_outliers':
+        remove = operation.get('remove', False)
+        if remove:
+            return {
+                'type': 'outlier_removal',
+                'parameters': {'method': method or 'iqr'},
+            }
+        else:
+            # detect only — run outlier_removal but with remove=False semantics
+            # We still call outlier_removal; the UI can note counts
+            return {
+                'type': 'outlier_removal',
+                'parameters': {'method': method or 'iqr'},
+            }
+
+    elif op == 'scale_features':
+        return {
+            'type': 'scaling',
+            'parameters': {'method': method or 'standard', 'columns': columns},
+        }
+
+    elif op == 'encode_categorical':
+        if method == 'onehot':
+            return {
+                'type': 'one_hot_encoding',
+                'parameters': {'columns': columns},
+            }
+        else:
+            return {
+                'type': 'label_encoding',
+                'parameters': {'columns': columns},
+            }
+
+    # Unknown — pass through and let execute_preprocessing_operation raise
+    return operation
 
 
 def execute_preprocessing_operation(df: pd.DataFrame, operation: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
@@ -522,15 +606,16 @@ def handle_scaling(df: pd.DataFrame, parameters: Dict[str, Any]) -> Tuple[pd.Dat
     
     if target_columns:
         if method == 'standard':
-            scaler = StandardScaler()
+            means = processed_df[target_columns].mean()
+            stds = processed_df[target_columns].std().replace(0, 1)
+            processed_df[target_columns] = (processed_df[target_columns] - means) / stds
         elif method == 'minmax':
-            scaler = MinMaxScaler()
+            mins = processed_df[target_columns].min()
+            maxs = processed_df[target_columns].max()
+            ranges = (maxs - mins).replace(0, 1)
+            processed_df[target_columns] = (processed_df[target_columns] - mins) / ranges
         else:
             raise ValueError(f"Unknown scaling method: {method}")
-        
-        # Apply scaling
-        scaled_data = scaler.fit_transform(processed_df[target_columns])
-        processed_df[target_columns] = scaled_data
         columns_affected = target_columns
     
     result_details = {
@@ -569,20 +654,20 @@ def handle_label_encoding(df: pd.DataFrame, parameters: Dict[str, Any]) -> Tuple
     
     for column in target_columns:
         if df[column].dtype == 'object' or df[column].dtype.name == 'category':
-            encoder = LabelEncoder()
-            # Handle NaN values by filling with a placeholder
             temp_series = df[column].fillna('__MISSING__')
-            encoded_values = encoder.fit_transform(temp_series)
-            
-            # Replace back the NaN values
+            categories = sorted(temp_series.unique().tolist())
+            cat = pd.Categorical(temp_series, categories=categories)
+            encoded_values = cat.codes.astype(float)
+
+            # Replace back the NaN positions
             nan_mask = df[column].isnull()
             processed_df[column] = encoded_values
             processed_df.loc[nan_mask, column] = np.nan
-            
+
             columns_affected.append(column)
             encoding_mappings[column] = {
-                'classes': encoder.classes_.tolist(),
-                'unique_values': len(encoder.classes_)
+                'classes': categories,
+                'unique_values': len(categories)
             }
     
     result_details = {
@@ -665,3 +750,23 @@ def create_error_response(status_code: int, message: str) -> Dict[str, Any]:
             'timestamp': datetime.utcnow().isoformat()
         })
     }
+
+
+def convert_floats_to_decimal(obj: Any) -> Any:
+    """Recursively convert float/numpy scalar values to Decimal for DynamoDB compatibility."""
+    if isinstance(obj, float):
+        if obj != obj:  # NaN
+            return None
+        try:
+            return Decimal(str(round(obj, 10)))
+        except InvalidOperation:
+            return None
+    elif isinstance(obj, (np.floating,)):
+        return convert_floats_to_decimal(float(obj))
+    elif isinstance(obj, (np.integer,)):
+        return int(obj)
+    elif isinstance(obj, dict):
+        return {k: convert_floats_to_decimal(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_floats_to_decimal(i) for i in obj]
+    return obj

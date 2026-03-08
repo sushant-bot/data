@@ -40,6 +40,9 @@ export interface PreviewResponse {
     rows: any[][];
     total_rows_shown: number;
     total_rows_available: number;
+    current_page: number;
+    total_pages: number;
+    page_size: number;
   };
   statistics: {
     column_stats: Record<string, any>;
@@ -50,6 +53,11 @@ export interface PreviewResponse {
     total_columns: number;
     file_size: number;
     upload_timestamp: string;
+    has_processed_data?: boolean;
+  };
+  download_urls?: {
+    original_csv?: string;
+    processed_csv?: string;
   };
 }
 
@@ -65,11 +73,46 @@ export interface PreprocessRequest {
   operations: PreprocessOperation[];
 }
 
+export interface OperationResult {
+  status: 'completed' | 'failed';
+  action: string;
+  original_operation?: string;
+  operation_type: string;
+  rows_before: number;
+  rows_after: number;
+  columns_before: number;
+  columns_after: number;
+  nulls_before?: number;
+  nulls_after?: number;
+  nulls_removed?: number;
+  null_per_column_before?: Record<string, number>;
+  null_per_column_after?: Record<string, number>;
+  // null handling
+  rows_removed?: number;
+  columns_removed?: number;
+  total_nulls_filled?: number;
+  columns_affected?: string[] | string;
+  strategy_used?: string;
+  method_used?: string;
+  // outlier
+  outliers_removed?: number;
+  // encoding
+  encoding_mappings?: Record<string, any>;
+  new_columns_added?: number;
+  error?: string;
+}
+
 export interface PreprocessResponse {
   session_id: string;
-  operations_applied: number;
-  processed_dataset_location: string;
-  operation_results: any[];
+  operations_completed: number;
+  operations_failed: number;
+  processed_dataset: {
+    s3_key: string;
+    shape: { rows: number; columns: number };
+  };
+  quality_metrics?: any;
+  operation_results: OperationResult[];
+  message: string;
 }
 
 // === Quality ===
@@ -127,6 +170,7 @@ export interface QualityResponse {
 // === ML Training ===
 export type Algorithm =
   | 'logistic_regression'
+  | 'linear_regression'
   | 'random_forest'
   | 'knn'
   | 'svm'
@@ -139,6 +183,7 @@ export interface TrainRequest {
   algorithm: Algorithm;
   target_column?: string;
   feature_columns: string[];
+  dataset_type?: 'processed' | 'original';
   parameters?: Record<string, any>;
 }
 
@@ -146,10 +191,16 @@ export interface TrainResponse {
   session_id: string;
   model_type: string;
   algorithm: string;
+  dataset_type?: 'processed' | 'original';
   results: {
-    metrics: Record<string, any>;
-    training_details: Record<string, any>;
-    model_location: string;
+    model_type: string;
+    algorithm: string;
+    target_column?: string;
+    feature_columns: string[];
+    metrics: Record<string, number>;
+    visualizations?: string[];
+    label_encoder_classes?: string[] | null;
+    n_clusters?: number;
   };
 }
 

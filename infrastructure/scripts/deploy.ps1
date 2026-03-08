@@ -51,6 +51,19 @@ function Show-Help {
 
 # Function to check if AWS CLI is installed and configured
 function Test-AwsCli {
+    # Try to find aws.exe in common install locations and add to PATH if needed
+    $commonPaths = @(
+        "C:\Program Files\Amazon\AWSCLIV2",
+        "C:\Program Files (x86)\Amazon\AWSCLIV2",
+        "$env:LOCALAPPDATA\Programs\Amazon\AWSCLIV2",
+        "$env:ProgramFiles\Amazon\AWSCLIV2"
+    )
+    foreach ($p in $commonPaths) {
+        if (Test-Path "$p\aws.exe") {
+            $env:PATH = "$p;$env:PATH"
+            break
+        }
+    }
     try {
         $null = Get-Command aws -ErrorAction Stop
         $null = aws sts get-caller-identity 2>$null
@@ -93,25 +106,25 @@ function Test-Templates {
 function Publish-Templates {
     Write-Status "Creating S3 bucket for CloudFormation templates..."
     
-    $accountId = (aws sts get-caller-identity --query Account --output text)
+    $accountId = (aws sts get-caller-identity --query Account --output text).Trim()
     $bucketName = "$ProjectName-cf-templates-$Environment-$accountId"
     
-    # Create bucket if it doesn't exist
-    try {
-        $null = aws s3 ls "s3://$bucketName" 2>$null
-        Write-Status "S3 bucket already exists: $bucketName"
-    }
-    catch {
-        aws s3 mb "s3://$bucketName" --region $Region
-        Write-Success "Created S3 bucket: $bucketName"
+    # Create bucket if it doesn't exist (suppress stdout so it doesn't corrupt return value)
+    aws s3 ls "s3://$bucketName" 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        aws s3 mb "s3://$bucketName" --region $Region | Out-Null
+        Write-Host "[SUCCESS] Created S3 bucket: $bucketName" -ForegroundColor Green
+    } else {
+        Write-Host "[INFO] S3 bucket already exists: $bucketName" -ForegroundColor Blue
     }
 
-    # Upload templates
-    Write-Status "Uploading CloudFormation templates to S3..."
-    aws s3 sync infrastructure/cloudformation/ "s3://$bucketName/templates/" --exclude "master-template.yaml"
+    # Upload templates (suppress stdout)
+    Write-Host "[INFO] Uploading CloudFormation templates to S3..." -ForegroundColor Blue
+    aws s3 sync infrastructure/cloudformation/ "s3://$bucketName/templates/" --exclude "master-template.yaml" | Out-Null
     
-    Write-Success "Templates uploaded to S3"
-    return $bucketName
+    Write-Host "[SUCCESS] Templates uploaded to S3" -ForegroundColor Green
+    # Return ONLY the bucket name - must be last statement with no other pipeline output
+    Write-Output $bucketName
 }
 
 # Function to deploy the infrastructure
@@ -129,9 +142,21 @@ function Deploy-Infrastructure {
     $content = $content -replace "./cloudfront.yaml", "https://$TemplateBucket.s3.$Region.amazonaws.com/templates/cloudfront.yaml"
     $content | Set-Content $masterTemplate
 
+    # Delete stack if it's in ROLLBACK_COMPLETE state (must delete before recreating)
+    $stackStatusRaw = aws cloudformation describe-stacks --stack-name $StackName --region $Region --query 'Stacks[0].StackStatus' --output text 2>$null
+    $stackStatus = if ($stackStatusRaw) { $stackStatusRaw.Trim() } else { '' }
+    if ($stackStatus -eq 'ROLLBACK_COMPLETE') {
+        Write-Host "[INFO] Stack is in ROLLBACK_COMPLETE state. Deleting before recreating..." -ForegroundColor Blue
+        aws cloudformation delete-stack --stack-name $StackName --region $Region | Out-Null
+        Write-Host "[INFO] Waiting for stack deletion..." -ForegroundColor Blue
+        aws cloudformation wait stack-delete-complete --stack-name $StackName --region $Region
+        Write-Host "[SUCCESS] Old stack deleted." -ForegroundColor Green
+        $stackStatus = ''
+    }
+
     # Check if stack exists
-    try {
-        $null = aws cloudformation describe-stacks --stack-name $StackName --region $Region 2>$null
+    aws cloudformation describe-stacks --stack-name $StackName --region $Region 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
         Write-Status "Stack exists. Updating..."
         aws cloudformation update-stack `
             --stack-name $StackName `
@@ -139,11 +164,13 @@ function Deploy-Infrastructure {
             --parameters "ParameterKey=ProjectName,ParameterValue=$ProjectName" "ParameterKey=Environment,ParameterValue=$Environment" `
             --capabilities CAPABILITY_IAM `
             --region $Region
-
-        Write-Status "Waiting for stack update to complete..."
-        aws cloudformation wait stack-update-complete --stack-name $StackName --region $Region
-    }
-    catch {
+        if ($LASTEXITCODE -eq 0) {
+            Write-Status "Waiting for stack update to complete..."
+            aws cloudformation wait stack-update-complete --stack-name $StackName --region $Region
+        } else {
+            Write-Status "No updates needed or update skipped."
+        }
+    } else {
         Write-Status "Creating new stack..."
         aws cloudformation create-stack `
             --stack-name $StackName `
@@ -152,9 +179,16 @@ function Deploy-Infrastructure {
             --capabilities CAPABILITY_IAM `
             --region $Region `
             --tags "Key=Project,Value=$ProjectName" "Key=Environment,Value=$Environment" "Key=ManagedBy,Value=CloudFormation"
-
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Failed to create CloudFormation stack. Check template errors above."
+            exit 1
+        }
         Write-Status "Waiting for stack creation to complete..."
         aws cloudformation wait stack-create-complete --stack-name $StackName --region $Region
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Stack creation failed. Check CloudFormation console for details."
+            exit 1
+        }
     }
 
     # Clean up temporary file
