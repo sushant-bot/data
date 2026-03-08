@@ -480,45 +480,63 @@ def store_ml_results(session_id: str, results: Dict[str, Any]):
     """Store ML training results in DynamoDB."""
     try:
         operations_table = dynamodb.Table(OPERATIONS_TABLE)
-        
-        # Store results
-        operations_table.put_item(
-            Item={
-                'session_id': session_id,
-                'timestamp': datetime.now().isoformat(),
-                'operation_type': 'ml_results',
-                'model_type': results['model_type'],
-                'algorithm': results['algorithm'],
-                'metrics': results['metrics'],
-                'visualizations': results['visualizations'],
-                'feature_columns': results.get('feature_columns', []),
-                'target_column': results.get('target_column'),
-                'n_clusters': results.get('n_clusters')
-            }
-        )
-        
+
+        # Convert floats to Decimal for DynamoDB compatibility
+        item = {
+            'session_id': session_id,
+            'timestamp': datetime.now().isoformat(),
+            'operation_type': 'ml_results',
+            'model_type': results['model_type'],
+            'algorithm': results['algorithm'],
+            'metrics': json.loads(json.dumps(results['metrics'], default=str)),
+            'visualizations': results['visualizations'],
+            'feature_columns': results.get('feature_columns', []),
+            'target_column': results.get('target_column'),
+            'n_clusters': results.get('n_clusters')
+        }
+        item = convert_floats_to_decimal(item)
+
+        operations_table.put_item(Item=item)
+
         logger.info(f"Stored ML results for session {session_id}")
-        
+
     except Exception as e:
         logger.error(f"Error storing ML results: {str(e)}")
         raise
 
-def log_operation(session_id: str, operation_id: str, operation_type: str, 
+
+def convert_floats_to_decimal(obj):
+    """Recursively convert float values to Decimal for DynamoDB."""
+    from decimal import Decimal
+    if isinstance(obj, float):
+        if obj != obj:  # NaN check
+            return None
+        return Decimal(str(round(obj, 10)))
+    elif isinstance(obj, dict):
+        return {k: convert_floats_to_decimal(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_floats_to_decimal(i) for i in obj]
+    elif isinstance(obj, np.floating):
+        return Decimal(str(round(float(obj), 10)))
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    return obj
+
+def log_operation(session_id: str, operation_id: str, operation_type: str,
                  status: str, details: Dict[str, Any]):
     """Log operation to DynamoDB."""
     try:
         operations_table = dynamodb.Table(OPERATIONS_TABLE)
-        
-        operations_table.put_item(
-            Item={
-                'session_id': session_id,
-                'timestamp': datetime.now().isoformat(),
-                'operation_id': operation_id,
-                'operation_type': operation_type,
-                'status': status,
-                'details': details
-            }
-        )
-        
+
+        item = {
+            'session_id': session_id,
+            'timestamp': datetime.now().isoformat(),
+            'operation_id': operation_id,
+            'operation_type': operation_type,
+            'status': status,
+            'details': convert_floats_to_decimal(details)
+        }
+        operations_table.put_item(Item=item)
+
     except Exception as e:
         logger.error(f"Error logging operation: {str(e)}")

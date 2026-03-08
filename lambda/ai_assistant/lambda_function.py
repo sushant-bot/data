@@ -109,10 +109,14 @@ def lambda_handler(event, context):
         # Log the operation
         log_operation(session_id, 'ai_recommendation', 'completed')
 
+        # Transform response to match frontend expected shape
+        frontend_recommendations = transform_recommendations_for_frontend(recommendations)
+        frontend_characteristics = transform_characteristics_for_frontend(characteristics)
+
         return create_response(200, {
             'session_id': session_id,
-            'recommendations': recommendations,
-            'data_characteristics': characteristics,
+            'recommendations': frontend_recommendations,
+            'data_characteristics': frontend_characteristics,
             'cached': cached_response is not None
         })
 
@@ -655,6 +659,74 @@ def log_operation(session_id: str, operation_type: str, status: str) -> None:
         })
     except Exception as e:
         logger.error(f"Error logging operation: {str(e)}")
+
+
+def transform_recommendations_for_frontend(recommendations: Dict[str, Any]) -> Dict[str, Any]:
+    """Transform Lambda recommendations into the shape the frontend expects."""
+    # Convert recommended_models objects to string array
+    model_suggestions = []
+    for m in recommendations.get('recommended_models', []):
+        if isinstance(m, dict):
+            name = m.get('model', '')
+            reasoning = m.get('reasoning', '')
+            confidence = m.get('confidence', 0)
+            model_suggestions.append(f"{name} (confidence: {confidence:.0%}) - {reasoning}")
+        else:
+            model_suggestions.append(str(m))
+
+    # Convert recommended_preprocessing objects to string array
+    preprocessing_suggestions = []
+    for p in recommendations.get('recommended_preprocessing', []):
+        if isinstance(p, dict):
+            step = p.get('step', '')
+            reasoning = p.get('reasoning', '')
+            preprocessing_suggestions.append(f"{step} - {reasoning}")
+        else:
+            preprocessing_suggestions.append(str(p))
+
+    # Convert quality_recommendations objects to string array
+    quality_recommendations = []
+    for q in recommendations.get('quality_recommendations', []):
+        if isinstance(q, dict):
+            action = q.get('action', '')
+            reasoning = q.get('reasoning', '')
+            priority = q.get('priority', '')
+            quality_recommendations.append(f"[{priority}] {action} - {reasoning}")
+        else:
+            quality_recommendations.append(str(q))
+
+    # Build feature engineering ideas from analysis
+    feature_engineering_ideas = []
+    reasoning = recommendations.get('reasoning', '')
+    if reasoning:
+        feature_engineering_ideas.append(reasoning)
+
+    # Build warnings
+    warnings = []
+    source = recommendations.get('source', '')
+    if source == 'rule_based_fallback':
+        warnings.append('AI service was unavailable - using rule-based recommendations')
+
+    return {
+        'preprocessing_suggestions': preprocessing_suggestions,
+        'model_suggestions': model_suggestions,
+        'feature_engineering_ideas': feature_engineering_ideas,
+        'quality_recommendations': quality_recommendations,
+        'warnings': warnings,
+        'quality_score': recommendations.get('quality_score', 0),
+    }
+
+
+def transform_characteristics_for_frontend(characteristics: Dict[str, Any]) -> Dict[str, Any]:
+    """Transform characteristics into the shape the frontend expects."""
+    return {
+        'num_rows': characteristics.get('num_rows', 0),
+        'num_columns': characteristics.get('num_columns', 0),
+        'num_numeric': characteristics.get('numeric_columns', 0),
+        'num_categorical': characteristics.get('categorical_columns', 0),
+        'missing_percentage': characteristics.get('missing_percentage', 0),
+        'duplicate_percentage': 0,  # Not computed in analysis
+    }
 
 
 def create_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
